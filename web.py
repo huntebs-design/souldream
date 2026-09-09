@@ -249,7 +249,7 @@ def home_page() -> str:
     <p class="lede">Talk through a relationship concern, find the words you want to use, and practise the conversation before having it at home.</p>
     <p class="roman-urdu" lang="ur-Latn">Jo baat kehna mushkil ho, pehle yahan keh lijiye.</p>
     <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="button button-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Download Android app</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
-    <ul class="facts"><li>Adults 18+</li><li>English, Urdu and Roman Urdu</li><li>Delete chats from your account</li></ul>
+    <ul class="facts"><li>Adults 18+</li><li>English, Urdu and Roman Urdu</li><li>End-to-end encrypted on your device</li></ul>
   </div>
   <div class="hero-art"><img src="/assets/dilse-woman-letter.webp" width="768" height="1024" alt="Illustration of a Pakistani woman holding a letter beside a window"><p>A place to prepare the words you have been holding back.</p></div>
 </section>
@@ -383,7 +383,7 @@ def information_page(kind: str) -> str:
             "Find the right DilSe channel for conversation feedback, account controls, privacy questions and urgent safety concerns.",
             "Contact and support",
             "Use the channel connected to your issue. DilSe does not currently list a public general-support inbox, and notification messages should not be treated as a support channel.",
-            ["For an issue with a DilSe response, use the feedback control shown with that response.", "For stored chats, retention or account deletion, open your account settings. These controls remain the most direct way to manage your data.", "For immediate danger, do not wait for a DilSe reply. Use the Pakistan safety information and contact an appropriate emergency or local support service."],
+            ["For an issue with a DilSe response, use the feedback control shown with that response.", "For session data, local clearing or account deletion, open your account settings. These controls remain the most direct way to manage your data on your device.", "For immediate danger, do not wait for a DilSe reply. Use the Pakistan safety information and contact an appropriate emergency or local support service."],
         ),
         }
     title, description, heading, intro, points = pages[kind]
