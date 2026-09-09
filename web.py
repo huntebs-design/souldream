@@ -261,9 +261,28 @@ def home_page() -> str:
   <div class="hero-art"><img src="/assets/dilse-woman-letter.webp" width="768" height="1024" alt="Illustration of a Pakistani woman holding a letter beside a window"><p>A place to prepare the words you have been holding back.</p></div>
 </section>
 <section class="trust-heritage">
-  <p class="eyebrow">Proven impact & clinical heritage</p>
-  <h2>Over 500,000 women supported · Built on psychological expertise</h2>
-  <p class="lede">DilSe has helped over 500,000 women across Pakistan navigate relationship challenges, mental health concerns, and family communications. Previously operating with the guidance of experienced licensed psychologists, we built this platform by embedding that clinical expertise into an AI system heavily trained by world-leading psychologists—delivering 24/7, confidential support with 100% on-device privacy.</p>
+  <div class="trust-heritage-header">
+    <p class="eyebrow">Proven impact & clinical heritage</p>
+    <h2>Over 500,000 women supported · Built on psychological expertise</h2>
+    <p class="lede">From human-led psychological care to a 24/7 on-device AI platform trained by world-leading psychologists.</p>
+  </div>
+  <div class="trust-heritage-grid">
+    <article>
+      <div class="stat-number">500,000+</div>
+      <h3>Women Supported</h3>
+      <p>DilSe has helped over 500,000 women across Pakistan navigate relationship challenges, mental health concerns, and family communications.</p>
+    </article>
+    <article>
+      <div class="stat-icon">🧠</div>
+      <h3>Psychologist-Trained AI</h3>
+      <p>Previously operating alongside experienced licensed psychologists, we embedded that clinical expertise into an AI system heavily trained by leading psychologists.</p>
+    </article>
+    <article>
+      <div class="stat-icon">🔒</div>
+      <h3>100% On-Device Privacy</h3>
+      <p>Military-grade end-to-end encryption ensures your conversations and private thoughts stay strictly on your device—never stored on external servers.</p>
+    </article>
+  </div>
 </section>
 <section class="intro-block">
   <p class="eyebrow">Two ways to begin</p><h2>Talk it through or practise the reply</h2>
