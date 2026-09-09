@@ -41,9 +41,10 @@ h3 { font-size: 1.45rem; }
 .hero-art { position: relative; background: var(--mist); border-radius: 42% 42% 1rem 1rem; padding: 1.2rem 1.2rem 0; }
 .hero-art img { display: block; border-radius: 40% 40% .5rem .5rem; max-height: 610px; width: 100%; object-fit: cover; object-position: top; }
 .hero-art p { position: absolute; bottom: 1.5rem; left: -2rem; max-width: 260px; background: var(--white); padding: 1rem; box-shadow: 0 14px 35px rgba(46,32,38,.15); }
-.intro-block, .topics, .notice, .final-cta, .text-page, .hub-page, .article-page { max-width: 1040px; margin: auto; padding: 6rem 2rem; }
+.intro-block, .topics, .notice, .trust-heritage, .final-cta, .text-page, .hub-page, .article-page { max-width: 1040px; margin: auto; padding: 6rem 2rem; }
 .two-up, .topic-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1.2rem; }
-.two-up article, .topic-card, .notice { padding: 2rem; background: var(--white); border: 1px solid var(--line); border-radius: 1rem; }
+.two-up article, .topic-card, .notice, .trust-heritage { padding: 2rem; background: var(--white); border: 1px solid var(--line); border-radius: 1rem; }
+.trust-heritage { margin-top: 4rem; margin-bottom: 4rem; padding: 3.5rem 3rem; box-shadow: 0 10px 30px rgba(87,31,53,.04); }
 .topic-card { text-decoration: none; }
 .topic-card p { color: var(--ink); }
 .topic-card span { font-weight: 750; }
@@ -147,7 +148,7 @@ footer { border-top: 1px solid var(--line); font-size: .9rem; }
   .hero-art { order: 2; max-width: 480px; }
   .hero-art p { left: .5rem; }
   .two-up, .topic-grid, .context { grid-template-columns: 1fr; }
-  .intro-block, .topics, .notice, .final-cta, .text-page, .hub-page, .article-page { width: 100%; padding: 3rem 1.2rem; }
+  .intro-block, .topics, .notice, .trust-heritage, .final-cta, .text-page, .hub-page, .article-page { width: 100%; padding: 3rem 1.2rem; }
   .hub-page, .article-page, .text-page { padding-top: 2rem; }
   .hub-page > h1, .article-header h1, .text-page h1 { font-size: clamp(2.2rem, 11vw, 3rem); line-height: 1.02; letter-spacing: -.035em; }
   .lede { font-size: 1.08rem; line-height: 1.65; }
@@ -163,7 +164,7 @@ footer { border-top: 1px solid var(--line); font-size: .9rem; }
   .script, .response-pair { padding: 1.1rem 1.2rem; }
   .script p { font-size: 1.08rem; line-height: 1.65; }
   .safety-note, .article-cta { padding: 1.5rem; margin: 3rem 0; }
-  .notice { margin-top: 3rem; margin-bottom: 3rem; }
+  .notice, .trust-heritage { margin-top: 3rem; margin-bottom: 3rem; padding: 2rem 1.2rem; }
   .context { padding: 4rem 1.2rem; gap: 1rem; }
   footer { align-items: flex-start; flex-direction: column; padding: 2rem 1.2rem; }
   .guide-grid { width: 100%; gap: 1.25rem; margin-top: 2.5rem; }
