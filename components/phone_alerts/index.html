@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #2e2026; background: transparent; }
+    .alert-card {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+      min-height: 92px;
+      padding: 14px 16px;
+      border: 1px solid #dac5ca;
+      border-radius: 18px;
+      background: linear-gradient(120deg, #fffdf9 0%, #f5e9ea 100%);
+    }
+    .bell {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      color: #fffdf9;
+      background: #571f35;
+      font-size: 20px;
+      box-shadow: 0 0 0 5px rgba(184, 92, 115, .12);
+    }
+    .copy strong { display: block; font-size: 15px; line-height: 1.25; }
+    .copy span { display: block; margin-top: 4px; color: #715d65; font-size: 12px; line-height: 1.35; }
+    button {
+      min-height: 38px;
+      padding: 9px 15px;
+      border: 1px solid #571f35;
+      border-radius: 999px;
+      color: #fffdf9;
+      background: #571f35;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary { color: #571f35; background: transparent; }
+    button:focus-visible { outline: 3px solid rgba(230, 161, 90, .65); outline-offset: 2px; }
+    button:disabled { cursor: wait; opacity: .62; }
+    @media (max-width: 480px) {
+      .alert-card { grid-template-columns: 38px 1fr; padding: 13px; }
+      .bell { width: 38px; height: 38px; }
+      button { grid-column: 1 / -1; width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="alert-card" role="group" aria-label="Phone response alerts">
+    <div class="bell" aria-hidden="true">&#128276;</div>
+    <div class="copy">
+      <strong id="status-title">Checking this browser…</strong>
+      <span id="status-copy">Alerts contain no conversation details.</span>
+    </div>
+    <button id="alert-action" disabled>Checking…</button>
+  </div>
+  <script>
+    const sendToStreamlit = (type, data = {}) => {
+      window.parent.postMessage({isStreamlitMessage: true, type, ...data}, "*");
+    };
+    const setValue = (value) => sendToStreamlit("streamlit:setComponentValue", {value});
+    const setHeight = () => sendToStreamlit("streamlit:setFrameHeight", {height: document.body.scrollHeight});
+    const title = document.getElementById("status-title");
+    const copy = document.getElementById("status-copy");
+    const button = document.getElementById("alert-action");
+    let args = {};
+    let currentSubscription = null;
+
+    const urlBase64ToUint8Array = (value) => {
+      const padding = "=".repeat((4 - value.length % 4) % 4);
+      const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(base64);
+      return Uint8Array.from([...raw].map((character) => character.charCodeAt(0)));
+    };
+
+    const activatedRegistration = async () => {
+      const registration = await window.parent.navigator.serviceWorker.register(args.sw_url);
+      if (registration.active) return registration;
+      const worker = registration.installing || registration.waiting;
+      if (!worker) return registration;
+      await new Promise((resolve, reject) => {
+        const timeout = window.setTimeout(() => reject(new Error("Service worker activation timed out")), 10000);
+        worker.addEventListener("statechange", () => {
+          if (worker.state === "activated") {
+            window.clearTimeout(timeout);
+            resolve();
+          }
+        });
+      });
+      return registration;
+    };
+
+    const render = () => {
+      const unsupported = !("Notification" in window.parent) || !("serviceWorker" in window.parent.navigator) || !("PushManager" in window.parent);
+      if (unsupported) {
+        title.textContent = "Phone alerts are not supported here";
+        copy.textContent = "Use current Chrome on Android, or keep email reminders enabled.";
+        button.textContent = "Unavailable";
+        button.disabled = true;
+        setHeight();
+        return;
+      }
+      if (window.parent.Notification.permission === "denied") {
+        title.textContent = "Phone alerts are blocked in Chrome";
+        copy.textContent = "Open this site's Chrome permissions to allow notifications.";
+        button.textContent = "Blocked";
+        button.disabled = true;
+      } else if (currentSubscription) {
+        title.textContent = "Phone alerts are on for this browser";
+        copy.textContent = "A private DilSe alert will sound when a response arrives in the background.";
+        button.textContent = "Turn off";
+        button.className = "secondary";
+        button.disabled = false;
+      } else {
+        title.textContent = "Hear when DilSe replies";
+        copy.textContent = "One tap lets Android play its normal notification sound. No message text is shown.";
+        button.textContent = "Allow alerts";
+        button.className = "";
+        button.disabled = false;
+      }
+      setHeight();
+    };
+
+    const initialize = async () => {
+      try {
+        const registration = await activatedRegistration();
+        currentSubscription = await registration.pushManager.getSubscription();
+      } catch (_) {
+        currentSubscription = null;
+      }
+      render();
+    };
+
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        const registration = await activatedRegistration();
+        currentSubscription = await registration.pushManager.getSubscription();
+        if (currentSubscription) {
+          const endpoint = currentSubscription.endpoint;
+          await currentSubscription.unsubscribe();
+          currentSubscription = null;
+          setValue({
+            event_id: `${Date.now()}-${Math.random()}`,
+            action: "unsubscribe",
+            endpoint,
+          });
+        } else {
+          const permission = await window.parent.Notification.requestPermission();
+          if (permission !== "granted") {
+            render();
+            return;
+          }
+          currentSubscription = await registration.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: urlBase64ToUint8Array(args.public_key),
+          });
+          setValue({
+            event_id: `${Date.now()}-${Math.random()}`,
+            action: "subscribe",
+            subscription: currentSubscription.toJSON(),
+          });
+        }
+      } catch (error) {
+        title.textContent = "Phone alerts could not be changed";
+        copy.textContent = "Check Chrome notification permissions and try again.";
+      }
+      render();
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.data?.type !== "streamlit:render") return;
+      args = event.data.args || {};
+      initialize();
+    });
+    sendToStreamlit("streamlit:componentReady", {apiVersion: 1});
+    setHeight();
+  </script>
+</body>
+</html>

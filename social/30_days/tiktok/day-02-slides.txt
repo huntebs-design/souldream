@@ -1,0 +1,15 @@
+file '../assets/day-02/slide-01.png'
+duration 2.5
+file '../assets/day-02/slide-02.png'
+duration 2.5
+file '../assets/day-02/slide-03.png'
+duration 2.5
+file '../assets/day-02/slide-04.png'
+duration 2.5
+file '../assets/day-02/slide-05.png'
+duration 2.5
+file '../assets/day-02/slide-06.png'
+duration 2.5
+file '../assets/day-02/slide-07.png'
+duration 3
+file '../assets/day-02/slide-07.png'

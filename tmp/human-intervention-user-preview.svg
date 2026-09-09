@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#571f35" flood-opacity="0.10"/>
+    </filter>
+    <style>
+      .sans { font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif; }
+      .serif { font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif; }
+      .small { font-size: 14px; }
+      .body { font-size: 17px; }
+      .label { font-size: 13px; letter-spacing: .4px; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="1100" fill="#eadde0"/>
+  <rect x="34" y="28" width="1372" height="1044" rx="18" fill="#fbf4ec" filter="url(#shadow)"/>
+  <rect x="34" y="28" width="1372" height="50" rx="18" fill="#fffdf9"/>
+  <circle cx="64" cy="53" r="6" fill="#d98b8b"/>
+  <circle cx="84" cy="53" r="6" fill="#e6a15a"/>
+  <circle cx="104" cy="53" r="6" fill="#9db58e"/>
+  <rect x="236" y="40" width="970" height="27" rx="13" fill="#f1e4e5"/>
+  <text x="721" y="59" text-anchor="middle" class="sans small" fill="#806a71">http://127.0.0.1:8501/</text>
+
+  <rect x="34" y="78" width="250" height="994" fill="#f1e4e5"/>
+  <line x1="284" y1="78" x2="284" y2="1072" stroke="#dbc8cc"/>
+  <text x="72" y="140" class="serif" font-size="38" font-weight="700" fill="#571f35">DilSe</text>
+  <text x="72" y="162" class="sans label" fill="#b85c73">DIL SE, BAAT DIL KI</text>
+  <rect x="58" y="205" width="202" height="48" rx="8" fill="#fffdf9"/>
+  <circle cx="82" cy="229" r="7" fill="#e6a15a"/>
+  <text x="101" y="235" class="sans body" fill="#571f35" font-weight="650">Talk</text>
+  <text x="72" y="292" class="sans body" fill="#6f5962">Exercises</text>
+  <text x="72" y="337" class="sans body" fill="#6f5962">Privacy</text>
+  <text x="72" y="382" class="sans body" fill="#6f5962">Your usage</text>
+  <rect x="58" y="848" width="202" height="112" rx="8" fill="#fff9f3" stroke="#d6c1c4"/>
+  <text x="74" y="878" class="sans small" fill="#5a444d">Chats stored for 30 days</text>
+  <text x="74" y="904" class="sans small" fill="#5a444d">Admin review allowed</text>
+  <text x="74" y="930" class="sans small" fill="#5a444d">Live human help allowed</text>
+
+  <g transform="translate(328,112)">
+    <rect width="1034" height="154" rx="8" fill="#fffdf9" stroke="#dcc8c9" filter="url(#shadow)"/>
+    <text x="36" y="37" class="sans label" font-weight="700" fill="#b85c73" letter-spacing="2">YOUR WORDS REMAIN YOURS</text>
+    <text x="36" y="87" class="serif" font-size="42" font-weight="700" fill="#571f35">Speak from the heart</text>
+    <text x="36" y="120" class="sans body" fill="#674c56">Talk something through with The Listener, or rehearse it with The Partner.</text>
+  </g>
+
+  <text x="345" y="302" class="sans body" fill="#2e2026" font-weight="650">Choose how DilSe responds</text>
+  <rect x="345" y="320" width="142" height="40" rx="20" fill="#571f35"/>
+  <text x="416" y="346" text-anchor="middle" class="sans small" fill="#fffdf9" font-weight="700">The Listener</text>
+  <rect x="499" y="320" width="142" height="40" rx="20" fill="#fffdf9" stroke="#d6c1c4"/>
+  <text x="570" y="346" text-anchor="middle" class="sans small" fill="#67515a">The Partner</text>
+
+  <g transform="translate(345,398)">
+    <circle cx="24" cy="24" r="22" fill="#eadde0"/>
+    <text x="24" y="30" text-anchor="middle" class="serif" font-size="20" font-weight="700" fill="#571f35">D</text>
+    <rect x="58" y="0" width="720" height="88" rx="18" fill="#fffdf9" stroke="#deced0"/>
+    <text x="82" y="34" class="sans body" fill="#2e2026">I’ve read what you shared. Let’s slow this down and focus on the one</text>
+    <text x="82" y="59" class="sans body" fill="#2e2026">responsibility that is exhausting you most today.</text>
+  </g>
+
+  <g transform="translate(345,530)">
+    <rect x="400" y="0" width="470" height="76" rx="18" fill="#f0d7d7"/>
+    <text x="425" y="31" class="sans body" fill="#3c2831">The school planning is what</text>
+    <text x="425" y="56" class="sans body" fill="#3c2831">drains me most.</text>
+  </g>
+
+  <g transform="translate(345,642)">
+    <circle cx="24" cy="24" r="22" fill="#eadde0"/>
+    <text x="24" y="30" text-anchor="middle" class="serif" font-size="20" font-weight="700" fill="#571f35">D</text>
+    <rect x="58" y="0" width="860" height="112" rx="18" fill="#fffdf9" stroke="#deced0"/>
+    <text x="82" y="31" class="sans body" fill="#2e2026">That makes sense. We can treat school planning as one complete area</text>
+    <text x="82" y="56" class="sans body" fill="#2e2026">for your partner to own, including notices, forms, fees, and follow-up,</text>
+    <text x="82" y="81" class="sans body" fill="#2e2026">without you managing it.</text>
+  </g>
+
+  <rect x="345" y="932" width="990" height="1" fill="#dbc8cc"/>
+  <text x="345" y="960" class="sans small" fill="#806a71">What would you like to say or practise?</text>
+</svg>

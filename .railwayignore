@@ -1,0 +1,24 @@
+.git/
+.railway/
+backups/
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+tmp/
+tests/
+app 2.py
+main 2.py
+README 2.md
+CULTURAL_RESEARCH.md
+PROJECT_CONTEXT.md
+mobile/

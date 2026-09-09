@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DilSe mobile preview</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; }
+    body {
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #24151d;
+      color: #fff9f4;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { text-align: center; }
+    header { margin-bottom: 14px; }
+    header strong { display: block; font-size: 15px; }
+    header span { display: block; margin-top: 3px; color: #d7c4cc; font-size: 12px; }
+    .phone {
+      width: 390px;
+      height: min(844px, calc(100vh - 100px));
+      overflow: hidden;
+      border: 9px solid #100b0e;
+      border-radius: 38px;
+      background: #fff;
+      box-shadow: 0 26px 65px rgba(0,0,0,.42);
+    }
+    iframe { display: block; width: 100%; height: 100%; border: 0; background: #fcfaf7; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><strong>DilSe mobile preview</strong><span>390 px viewport</span></header>
+    <div class="phone">
+      <iframe title="DilSe mobile view" src="http://127.0.0.1:8501/?mobile-preview=1"></iframe>
+    </div>
+  </main>
+</body>
+</html>

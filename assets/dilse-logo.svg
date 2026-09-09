@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 430 112" role="img" aria-labelledby="title desc">
+  <title id="title">DilSe</title>
+  <desc id="desc">DilSe, from the heart</desc>
+  <g transform="translate(0 0)">
+    <path fill="#184F4A" d="M18 10h33c28.2 0 49 19.3 49 46S79.2 102 51 102H18V10Z"/>
+    <path fill="#FFF9F2" d="M38 30h13c16.7 0 28.5 10.5 28.5 26S67.7 82 51 82H38V30Z"/>
+    <path fill="#B85C73" d="M18 10 38 30v52l-20 20V10Z"/>
+    <path fill="#F0B46F" d="m38 30 13 18 13-18h-9.5L51 35l-3.5-5H38Z"/>
+    <path fill="#184F4A" d="m38 82 13-14 13 14H38Z"/>
+  </g>
+  <text x="126" y="68" fill="#571F35" font-family="Iowan Old Style, Palatino Linotype, Georgia, serif" font-size="62" font-weight="600" letter-spacing="-2">DilSe</text>
+  <text x="129" y="91" fill="#88425A" font-family="Avenir Next, Avenir, Segoe UI, sans-serif" font-size="10.5" font-weight="700" letter-spacing="2.4">FROM THE HEART · دل سے</text>
+</svg>

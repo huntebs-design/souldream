@@ -1,0 +1,7 @@
+file '../assets/day-06/story-01.png'
+duration 3
+file '../assets/day-06/story-02.png'
+duration 3
+file '../assets/day-06/story-03.png'
+duration 3
+file '../assets/day-06/story-03.png'

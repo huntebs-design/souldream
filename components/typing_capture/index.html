@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>DilSe typing capture</title>
+  <style>html, body { margin: 0; width: 0; height: 0; overflow: hidden; }</style>
+</head>
+<body>
+<script>
+(() => {
+  const STREAMLIT_MESSAGE = true;
+  let activeInput = null;
+  let activeInputContainer = null;
+  let typing = false;
+  let lastHeartbeat = 0;
+  let heartbeatTimer = null;
+  let observer = null;
+  let readObserver = null;
+  let assistantMessageIds = [];
+  let suppressEventsUntil = 0;
+  let confirmedReadIds = new Set();
+  const pendingReadIds = new Set();
+  const intersectingReadIds = new Set();
+  const observedReadElements = new WeakSet();
+  const RECORDING_EVENT = "dilse:voice-recording";
+
+  const post = (type, extra = {}) => {
+    window.parent.postMessage(
+      { isStreamlitMessage: STREAMLIT_MESSAGE, type, ...extra },
+      "*"
+    );
+  };
+
+  const setFrameHeight = () => post("streamlit:setFrameHeight", { height: 0 });
+
+  const sendComponentValue = (value) => {
+    const now = Date.now();
+    post("streamlit:setComponentValue", {
+      value: {
+        ...value,
+        message_ids: Array.from(pendingReadIds),
+        event_id: `${now}-${Math.random().toString(36).slice(2, 9)}`
+      }
+    });
+  };
+
+  const sendRecording = (isRecording) => {
+    sendComponentValue({
+      event_type: "recording",
+      is_recording: Boolean(isRecording)
+    });
+  };
+
+  const installRecordingGuard = () => {
+    let parentWindow;
+    let parentDocument;
+    try {
+      parentWindow = window.parent;
+      parentDocument = parentWindow.document;
+    } catch (_) {
+      return;
+    }
+    if (!parentWindow.MediaRecorder) return;
+    if (!parentWindow.__dilseActiveMediaRecorders) {
+      parentWindow.__dilseActiveMediaRecorders = new Set();
+    }
+    if (!parentWindow.__dilseMediaRecorderPatched) {
+      const NativeMediaRecorder = parentWindow.MediaRecorder;
+      const TrackedMediaRecorder = function(...args) {
+        const recorder = new NativeMediaRecorder(...args);
+        const update = (active) => {
+          if (active) parentWindow.__dilseActiveMediaRecorders.add(recorder);
+          else parentWindow.__dilseActiveMediaRecorders.delete(recorder);
+          const isRecording = parentWindow.__dilseActiveMediaRecorders.size > 0;
+          parentWindow.__dilseVoiceRecordingActive = isRecording;
+          parentDocument.dispatchEvent(
+            new CustomEvent(RECORDING_EVENT, { detail: { isRecording } })
+          );
+        };
+        recorder.addEventListener("start", () => update(true));
+        recorder.addEventListener("stop", () => update(false));
+        recorder.addEventListener("error", () => update(false));
+        return recorder;
+      };
+      TrackedMediaRecorder.prototype = NativeMediaRecorder.prototype;
+      TrackedMediaRecorder.isTypeSupported = (...args) =>
+        NativeMediaRecorder.isTypeSupported(...args);
+      parentWindow.MediaRecorder = TrackedMediaRecorder;
+      parentWindow.__dilseMediaRecorderPatched = true;
+    }
+    parentDocument.addEventListener(RECORDING_EVENT, (event) => {
+      sendRecording(Boolean(event.detail && event.detail.isRecording));
+    });
+    if (parentWindow.__dilseVoiceRecordingActive) sendRecording(true);
+  };
+
+  const sendTyping = (isTyping, force = false) => {
+    const now = Date.now();
+    if (!force && isTyping === typing && now - lastHeartbeat < 1100) return;
+    typing = isTyping;
+    lastHeartbeat = now;
+    sendComponentValue({
+      event_type: "typing",
+      is_typing: isTyping
+    });
+  };
+
+  const sendReadReceipts = () => {
+    let parentDocument;
+    try {
+      parentDocument = window.parent.document;
+    } catch (_) {
+      return;
+    }
+    if (
+      parentDocument.hidden ||
+      !parentDocument.hasFocus() ||
+      Date.now() < suppressEventsUntil
+    ) return;
+    intersectingReadIds.forEach((messageId) => {
+      if (
+        assistantMessageIds.includes(messageId) &&
+        !confirmedReadIds.has(messageId)
+      ) {
+        pendingReadIds.add(messageId);
+      }
+    });
+    confirmedReadIds.forEach((messageId) => pendingReadIds.delete(messageId));
+    if (!pendingReadIds.size) return;
+    sendComponentValue({
+      event_type: "read"
+    });
+  };
+
+  const refreshReadTargets = () => {
+    let parentWindow;
+    let parentDocument;
+    try {
+      parentWindow = window.parent;
+      parentDocument = parentWindow.document;
+    } catch (_) {
+      return;
+    }
+    if (!readObserver) {
+      readObserver = new parentWindow.IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          const marker = entry.target.querySelector("[data-dilse-read-message-id]");
+          const messageId = marker && Number(marker.dataset.dilseReadMessageId);
+          if (!Number.isInteger(messageId)) return;
+          if (entry.isIntersecting && entry.intersectionRatio > 0) {
+            intersectingReadIds.add(messageId);
+          } else {
+            intersectingReadIds.delete(messageId);
+          }
+        });
+        sendReadReceipts();
+      }, { threshold: 0.01 });
+    }
+    parentDocument
+      .querySelectorAll("[data-dilse-read-message-id]")
+      .forEach((marker) => {
+        const message = marker.closest('[data-testid="stChatMessage"]') || marker;
+        if (observedReadElements.has(message)) return;
+        observedReadElements.add(message);
+        readObserver.observe(message);
+      });
+  };
+
+  const onInput = () => {
+    if (Date.now() < suppressEventsUntil) return;
+    const hasDraft = Boolean(activeInput && activeInput.value.trim());
+    sendTyping(hasDraft, hasDraft !== typing);
+  };
+
+  const onKeyDown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      suppressEventsUntil = Date.now() + 2500;
+      typing = false;
+    }
+  };
+
+  const onComposerPointerDown = (event) => {
+    if (event.target && event.target.closest("button")) {
+      suppressEventsUntil = Date.now() + 2500;
+      typing = false;
+    }
+  };
+
+  const detach = () => {
+    if (!activeInput) return;
+    activeInput.removeEventListener("input", onInput);
+    activeInput.removeEventListener("keydown", onKeyDown);
+    if (activeInputContainer) {
+      activeInputContainer.removeEventListener("pointerdown", onComposerPointerDown);
+    }
+    activeInput = null;
+    activeInputContainer = null;
+  };
+
+  const attach = () => {
+    let parentDocument;
+    try {
+      parentDocument = window.parent.document;
+    } catch (_) {
+      return;
+    }
+    const nextInput = parentDocument.querySelector('[data-testid="stChatInput"] textarea');
+    if (!nextInput || nextInput === activeInput) return;
+    detach();
+    activeInput = nextInput;
+    activeInputContainer = activeInput.closest('[data-testid="stChatInput"]');
+    activeInput.addEventListener("input", onInput);
+    activeInput.addEventListener("keydown", onKeyDown);
+    if (activeInputContainer) {
+      activeInputContainer.addEventListener("pointerdown", onComposerPointerDown);
+    }
+    onInput();
+  };
+
+  window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "streamlit:render") {
+      const incomingIds = event.data.args && event.data.args.assistant_message_ids;
+      const acknowledgedIds = event.data.args && event.data.args.confirmed_read_ids;
+      assistantMessageIds = Array.isArray(incomingIds)
+        ? incomingIds.map(Number).filter(Number.isInteger)
+        : [];
+      confirmedReadIds = new Set(
+        Array.isArray(acknowledgedIds)
+          ? acknowledgedIds.map(Number).filter(Number.isInteger)
+          : []
+      );
+      confirmedReadIds.forEach((messageId) => pendingReadIds.delete(messageId));
+      setFrameHeight();
+      attach();
+      refreshReadTargets();
+      sendReadReceipts();
+    }
+  });
+
+  try {
+    window.parent.document.addEventListener("visibilitychange", sendReadReceipts);
+    window.parent.addEventListener("focus", sendReadReceipts);
+  } catch (_) {}
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  setFrameHeight();
+  installRecordingGuard();
+  attach();
+
+  try {
+    observer = new MutationObserver(() => {
+      attach();
+      refreshReadTargets();
+    });
+    observer.observe(window.parent.document.body, { childList: true, subtree: true });
+  } catch (_) {
+    window.setInterval(attach, 800);
+  }
+
+  heartbeatTimer = window.setInterval(() => {
+    attach();
+    refreshReadTargets();
+    if (Date.now() >= suppressEventsUntil) {
+      if (activeInput && activeInput.value.trim()) sendTyping(true, true);
+      sendReadReceipts();
+    }
+  }, 1500);
+
+  window.addEventListener("beforeunload", () => {
+    if (observer) observer.disconnect();
+    if (readObserver) readObserver.disconnect();
+    if (heartbeatTimer) window.clearInterval(heartbeatTimer);
+    detach();
+  });
+})();
+</script>
+</body>
+</html>

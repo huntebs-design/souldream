@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+.railway/
+backups/
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+.streamlit/secrets.toml
+.env.android
+mobile/android/key.properties
+mobile/android/*.jks
+mobile/android/*.keystore
+mobile/build/
+downloads/*.apk
+downloads/*.sha256
+
+# Local metadata and generated Flutter plugin files
+.DS_Store
+.flutter-plugins-dependencies*
