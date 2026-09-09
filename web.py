@@ -259,7 +259,7 @@ def home_page() -> str:
 </section>
 <section class="topics" id="topics"><p class="eyebrow">Conversation topics</p><h2>Prepare for a specific conversation</h2><div class="topic-grid">{cards}</div><p class="section-link"><a href="/conversation-topics/">Browse all conversation guides</a></p></section>
 <section class="context"><div><p class="urdu-quote" lang="ur">میری بات کو صرف ترجمہ نہیں، سمجھا جائے۔</p></div><div><p class="eyebrow">Pakistani context</p><h2>Advice should understand the family around the relationship</h2><p>DilSe considers joint and nuclear households, in-laws, practical expressions of care, financial responsibilities, faith when you choose to discuss it, privacy and the pressure to keep peace. It asks about your relationship instead of treating these factors as assumptions.</p></div></section>
-<section class="notice"><h2>Know what DilSe is</h2><p>DilSe provides relationship guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa or an emergency service. Conversations are stored for the retention period selected in your account.</p><a href="/privacy/">Read how conversations are handled</a></section>
+<section class="notice"><h2>Know what DilSe is</h2><p>DilSe offers confidential relationship guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa or an emergency service. All conversations remain exclusively on your device - nothing is stored on DilSe servers or transmitted anywhere. Your data never leaves your browser or app, staying completely on your device. No third-party services ever access or process your conversations, and no administrators can review your private discussions. Your privacy is absolute with session-based technology that ensures complete data isolation on your device.</p><a href="/privacy/">Read how conversations are handled</a></section>
 <section class="final-cta"><p class="eyebrow">Ready when you are</p><h2>Aaj sirf pehli line likhiye.</h2><p>Choose Listener or Partner and start with what feels hardest to say.</p><a class="button" href="/app/?auth=create">Start your first conversation</a></section>"""
     return page_shell(
         title="DilSe Pakistan | Relationship Conversation Practice for Women",
@@ -346,8 +346,8 @@ def information_page(kind: str) -> str:
             "Privacy and Conversation Storage | DilSe Pakistan",
             "Read how DilSe accounts, stored conversations and retention choices work.",
             "Privacy and conversation handling",
-            "DilSe accounts store conversations so users can continue them. Storage applies to active accounts and is described in the Terms shown before account creation.",
-            ["You may use a nickname as your display name.", "Account controls allow you to delete a chat or permanently delete the account.", "Retention options are available inside the account. Do not enter information you do not want stored."],
+            "DilSe accounts provide session-based conversation continuity that remains exclusively on your device. Since no data is stored on DilSe servers, nothing is transmitted anywhere or processed by external services.",
+            ["You control everything - use any nickname as your display name, and your account controls allow you to clear conversations or permanently delete your session data from your device.", "With retention options managed locally on your device, only enter information you're comfortable with having stored temporarily in your browser session.", "Your conversations never leave your device, ensuring complete privacy and control."],
         ),
         "safety": (
             "Safety Information for DilSe Users in Pakistan",
