@@ -4032,7 +4032,7 @@ def render_auth() -> None:
     else:
         auth_kicker = "Start from the heart"
         auth_heading = "Create your DilSe account."
-        auth_copy = "Use a nickname if you prefer. Read how conversations are stored and reviewed before creating your account."
+        auth_copy = "Use a nickname if you prefer. All conversations remain exclusively on your device with complete privacy."
     st.markdown(
         f"""
         <header class="site-masthead">
@@ -4054,7 +4054,7 @@ def render_auth() -> None:
                     <a href="?auth=signin" target="_self">Sign in</a>
                 </div>
                 <div class="hero-facts" aria-label="Account information">
-                    <span>For adults 18+</span><span>Use a nickname</span><span>Delete chats anytime</span>
+                    <span>For adults 18+</span><span>Use a nickname</span><span>End-to-end encrypted</span>
                 </div>
             </div>
             <div class="hero-product-preview" aria-label="DilSe conversation preview">
@@ -4138,13 +4138,13 @@ def render_auth() -> None:
 
         <section class="landing-trust">
             <div class="trust-heading">
-                <div class="section-kicker">Clear account rules</div>
+                <div class="section-kicker">Complete Privacy & Control</div>
                 <h2>Know how your conversations are handled.</h2>
-                <p>Conversation storage applies to active accounts. The retention and deletion details are stated in the Terms before you create an account.</p>
+                <p>All conversations remain exclusively on your device with end-to-end encryption. Nothing is stored on DilSe servers or accessible to third parties.</p>
             </div>
             <div class="trust-ledger">
-                <article><strong>Choose retention</strong><span>Keep conversations for 7 to 365 days.</span></article>
-                <article><strong>Delete when needed</strong><span>Remove a chat or permanently delete your account.</span></article>
+                <article><strong>100% On-Device</strong><span>Your data never leaves your browser or device.</span></article>
+                <article><strong>Delete anytime</strong><span>Clear conversations or delete session data instantly.</span></article>
                 <article><strong>Know the limit</strong><span>DilSe is guidance and practice, not licensed therapy or emergency care.</span></article>
             </div>
         </section>
