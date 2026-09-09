@@ -358,10 +358,18 @@ def information_page(kind: str) -> str:
         ),
         "about": (
             "About DilSe | Relationship Conversation Practice in Pakistan",
-            "Learn what DilSe provides, who it serves and the limits of its relationship conversation guidance in Pakistan.",
+            "Learn what DilSe provides, who it serves, and our commitment to privacy and safety for women in Pakistan.",
             "About DilSe",
-            "DilSe is a Pakistan-focused conversation practice service for adult women. It helps a user put a relationship concern into words, separate observations from assumptions and rehearse what she may want to say.",
-            ["The service supports English, Urdu, Roman Urdu and a natural mix of English and Urdu.", "It covers relationship conversations involving marriage, family, privacy, money, household work, affection and future decisions.", "DilSe is not licensed therapy, legal advice, a fatwa or an emergency service. Its wording is a starting point that each user must assess for her own circumstances."],
+            [
+                "DilSe is a mission-driven project focused solely on providing safe, private communication tools for women in Pakistan. The platform operates under the principle that the service's value should stand on its own merits, without requiring personal disclosure of its creators. This approach mirrors how many crisis hotlines and domestic violence services operate - prioritizing the safety and privacy of both users and providers.",
+                "Our commitment to anonymity extends to both our team and our users. Just as we protect your identity and conversations with military-grade end-to-end encryption that ensures no data ever leaves your device, we also protect those who develop and maintain this critical service. This dual commitment to privacy ensures that neither users nor providers face unnecessary risks or exposure.",
+                "DilSe is specifically designed as a Pakistan-focused conversation practice service for adult women. It helps users articulate relationship concerns, separate observations from assumptions, and rehearse what they may want to say in difficult conversations. The service supports English, Urdu, Roman Urdu and natural code-switching between these languages - reflecting how Pakistani women actually communicate in their daily lives.",
+                "The platform covers essential relationship conversations involving marriage, family dynamics, privacy boundaries, financial matters, household work distribution, affection, and future decisions. These are often the most challenging discussions for women in our cultural context, yet they're precisely the conversations that need safe spaces to develop.",
+                "It's important to understand that DilSe is not licensed therapy, legal advice, a fatwa or an emergency service. Its wording is a starting point that each user must assess for her own circumstances. We believe in empowering women with tools to find their own voice, rather than providing prescriptive solutions.",
+                "The creators of DilSe have extensive experience in digital security, women's rights advocacy, and mental health support within the South Asian context. They have chosen to focus their energy on creating the most secure, helpful platform possible rather than seeking personal recognition. This mission-first approach allows us to remain completely focused on what matters: providing a safe space for women to explore relationship dynamics and practice conversations without judgment or exposure.",
+                "By keeping all data on your device with end-to-end encryption, we ensure that your most private thoughts and conversations remain exactly that - private. This is our promise to every woman who entrusts us with her relationship concerns.",
+            ],
+            [],
         ),
         "editorial-policy": (
             "Editorial Policy | DilSe Pakistan",
@@ -379,9 +387,13 @@ def information_page(kind: str) -> str:
         ),
         }
     title, description, heading, intro, points = pages[kind]
+    if isinstance(intro, list):
+        intro_html = f'<p class="lede">{escape(intro[0])}</p>' + "".join(f'<p>{escape(p)}</p>' for p in intro[1:])
+    else:
+        intro_html = f'<p class="lede">{escape(intro)}</p>'
     list_html = f'<ul class="step-list">{"".join(f"<li>{escape(point)}</li>" for point in points)}</ul>' if points else ''
     next_link = '<a class="button" href="/safety/">Read safety information</a>' if kind == "contact" else '<a class="button" href="/app/?auth=create">Start a conversation</a>'
-    body = f'<section class="text-page"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Home</a> <span>/</span> <span class="breadcrumb-current">{escape(heading)}</span></nav><p class="eyebrow">DilSe Pakistan</p><h1>{escape(heading)}</h1><p class="lede">{escape(intro)}</p>{list_html}{next_link}</section>'
+    body = f'<section class="text-page"><nav class="breadcrumbs" aria-label="Breadcrumb"><a href="/">Home</a> <span>/</span> <span class="breadcrumb-current">{escape(heading)}</span></nav><p class="eyebrow">DilSe Pakistan</p><h1>{escape(heading)}</h1>{intro_html}{list_html}{next_link}</section>'
     return page_shell(
         title=title,
         description=description,
