@@ -285,12 +285,43 @@ def home_page() -> str:
   </div>
 </section>
 <section class="intro-block">
-  <p class="eyebrow">Two ways to begin</p><h2>Talk it through or practise the reply</h2>
+  <div class="section-header">
+    <p class="eyebrow">Two ways to begin</p>
+    <h2>Talk it through or practise the reply</h2>
+  </div>
   <div class="two-up"><article><h3>The Listener</h3><p>Explain what happened. DilSe asks focused questions and helps you separate the facts, your needs and the assumptions that still need checking.</p></article><article><h3>The Partner</h3><p>Describe the person and situation. Rehearse the exchange, pause for feedback and try another way of saying it.</p></article></div>
 </section>
-<section class="topics" id="topics"><p class="eyebrow">Conversation topics</p><h2>Prepare for a specific conversation</h2><div class="topic-grid">{cards}</div><p class="section-link"><a href="/conversation-topics/">Browse all conversation guides</a></p></section>
+<section class="topics" id="topics">
+  <div class="section-header">
+    <p class="eyebrow">Conversation topics</p>
+    <h2>Prepare for a specific conversation</h2>
+  </div>
+  <div class="topic-grid">{cards}</div>
+  <p class="section-link"><a href="/conversation-topics/">Browse all conversation guides →</a></p>
+</section>
 <section class="context"><div><p class="urdu-quote" lang="ur">میری بات کو صرف ترجمہ نہیں، سمجھا جائے۔</p></div><div><p class="eyebrow">Pakistani context</p><h2>Advice should understand the family around the relationship</h2><p>DilSe considers joint and nuclear households, in-laws, practical expressions of care, financial responsibilities, faith when you choose to discuss it, privacy and the pressure to keep peace. It asks about your relationship instead of treating these factors as assumptions.</p></div></section>
-<section class="notice"><h2>Know what DilSe is</h2><p>DilSe offers confidential relationship guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa or an emergency service. All conversations remain exclusively on your device - nothing is stored on DilSe servers or transmitted anywhere. Your data never leaves your browser or app, staying completely on your device. No third-party services ever access or process your conversations, and no administrators can review your private discussions. Your privacy is absolute with session-based technology that ensures complete data isolation on your device.</p><a href="/privacy/">Read how conversations are handled</a></section>
+<section class="notice">
+  <div class="notice-header">
+    <h2>Know what DilSe is</h2>
+  </div>
+  <div class="notice-grid">
+    <article>
+      <h3>🔒 100% On-Device Privacy</h3>
+      <p>All conversations remain exclusively on your device - nothing is stored on DilSe servers or transmitted anywhere. Your data never leaves your browser or app.</p>
+    </article>
+    <article>
+      <h3>🛡️ Absolute Confidentiality</h3>
+      <p>No third-party services ever access or process your conversations, and no administrators can review your private discussions. Complete data isolation.</p>
+    </article>
+    <article>
+      <h3>💡 Guidance & Practice</h3>
+      <p>DilSe offers confidential relationship guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa or an emergency service.</p>
+    </article>
+  </div>
+  <div class="notice-footer">
+    <a class="button button-app" href="/privacy/">Read how conversations are handled →</a>
+  </div>
+</section>
 <section class="final-cta"><p class="eyebrow">Ready when you are</p><h2>Aaj sirf pehli line likhiye.</h2><p>Choose Listener or Partner and start with what feels hardest to say.</p><a class="button" href="/app/?auth=create">Start your first conversation</a></section>"""
     return page_shell(
         title="DilSe Pakistan | Psychologist-Trained AI Relationship & Mental Health Guidance (500k+ Women Supported)",
@@ -317,8 +348,10 @@ def android_page() -> str:
   </div>
 </section>
 <section class="install-steps">
-  <p class="eyebrow">Install the signed APK</p>
-  <h2>Three steps on your Android phone</h2>
+  <div class="section-header">
+    <p class="eyebrow">Install the signed APK</p>
+    <h2>Three steps on your Android phone</h2>
+  </div>
   <ol>
     <li><strong>Download</strong><span>Tap the button above and keep the APK when Chrome confirms the download.</span></li>
     <li><strong>Allow this source</strong><span>If Android asks, allow your browser to install this DilSe update.</span></li>

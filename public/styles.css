@@ -44,6 +44,9 @@ h3 { font-size: 1.45rem; }
 .intro-block, .topics, .notice, .trust-heritage, .final-cta, .text-page, .hub-page, .article-page { max-width: 1040px; margin: auto; padding: 6rem 2rem; }
 .two-up, .topic-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1.2rem; }
 .two-up article, .topic-card, .notice, .trust-heritage { padding: 2rem; background: var(--white); border: 1px solid var(--line); border-radius: 1rem; }
+.section-header { margin-bottom: 2.5rem; text-align: center; }
+.section-header h2 { max-width: 850px; margin: auto; }
+.section-header .eyebrow { margin-bottom: .5rem; }
 .trust-heritage { margin-top: 4rem; margin-bottom: 4rem; padding: 3.5rem 3rem; box-shadow: 0 10px 30px rgba(87,31,53,.04); }
 .trust-heritage-header { margin-bottom: 2.5rem; text-align: center; }
 .trust-heritage-header h2 { max-width: 850px; margin: auto; }
@@ -57,11 +60,18 @@ h3 { font-size: 1.45rem; }
 .topic-card { text-decoration: none; }
 .topic-card p { color: var(--ink); }
 .topic-card span { font-weight: 750; }
-.section-link { margin-top: 2rem; font-weight: 750; }
+.section-link { margin-top: 2.5rem; text-align: center; font-weight: 750; }
 .context { background: var(--jam); color: var(--white); display: grid; grid-template-columns: .75fr 1.25fr; gap: 4rem; align-items: center; padding: 6rem max(2rem, calc((100vw - 1040px)/2)); }
 .context h2, .context .eyebrow { color: white; }
 .urdu-quote { font-family: Georgia, serif; font-size: clamp(2.4rem, 5vw, 4.8rem); line-height: 1.5; direction: rtl; }
-.notice { margin-top: 6rem; margin-bottom: 6rem; padding: 3rem; }
+.notice { margin-top: 6rem; margin-bottom: 6rem; padding: 3.5rem 3rem; box-shadow: 0 10px 30px rgba(87,31,53,.04); }
+.notice-header { margin-bottom: 2rem; text-align: center; }
+.notice-header h2 { max-width: 800px; margin: auto; }
+.notice-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.5rem; text-align: left; }
+.notice-grid article { padding: 1.6rem; background: var(--parchment); border: 1px solid var(--line); border-radius: .85rem; }
+.notice-grid h3 { font-size: 1.15rem; margin-bottom: .5rem; color: var(--jam); }
+.notice-grid p { font-size: .92rem; margin: 0; color: var(--ink); line-height: 1.55; }
+.notice-footer { text-align: center; margin-top: 2rem; }
 .final-cta { text-align: center; }
 .text-page { min-height: 70vh; max-width: 860px; padding-top: 7rem; }
 .text-page h1 { font-size: clamp(2.8rem, 6vw, 5rem); }
@@ -156,7 +166,7 @@ footer { border-top: 1px solid var(--line); font-size: .9rem; }
   .hero-copy { order: 1; }
   .hero-art { order: 2; max-width: 480px; }
   .hero-art p { left: .5rem; }
-  .two-up, .topic-grid, .context, .trust-heritage-grid { grid-template-columns: 1fr; }
+  .two-up, .topic-grid, .context, .trust-heritage-grid, .notice-grid { grid-template-columns: 1fr; }
   .intro-block, .topics, .notice, .trust-heritage, .final-cta, .text-page, .hub-page, .article-page { width: 100%; padding: 3rem 1.2rem; }
   .hub-page, .article-page, .text-page { padding-top: 2rem; }
   .hub-page > h1, .article-header h1, .text-page h1 { font-size: clamp(2.2rem, 11vw, 3rem); line-height: 1.02; letter-spacing: -.035em; }
