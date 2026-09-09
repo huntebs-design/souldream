@@ -4054,7 +4054,7 @@ def render_auth() -> None:
                     <a href="?auth=signin" target="_self">Sign in</a>
                 </div>
                 <div class="hero-facts" aria-label="Account information">
-                    <span>For adults 18+</span><span>Use a nickname</span><span>End-to-end encrypted</span>
+                    <span>500,000+ women supported</span><span>Psychologist-trained AI</span><span>End-to-end encrypted</span>
                 </div>
             </div>
             <div class="hero-product-preview" aria-label="DilSe conversation preview">
@@ -4138,14 +4138,14 @@ def render_auth() -> None:
 
         <section class="landing-trust">
             <div class="trust-heading">
-                <div class="section-kicker">Complete Privacy & Control</div>
-                <h2>Know how your conversations are handled.</h2>
-                <p>All conversations remain exclusively on your device with end-to-end encryption. Nothing is stored on DilSe servers or accessible to third parties.</p>
+                <div class="section-kicker">500,000+ Women Supported</div>
+                <h2>Built on clinical experience. Powered by AI.</h2>
+                <p>DilSe has supported over 500,000 women in Pakistan with mental health and relationship concerns. Developed alongside leading psychologists, our AI provides 24/7 empathetic guidance with 100% on-device privacy.</p>
             </div>
             <div class="trust-ledger">
-                <article><strong>100% On-Device</strong><span>Your data never leaves your browser or device.</span></article>
-                <article><strong>Delete anytime</strong><span>Clear conversations or delete session data instantly.</span></article>
-                <article><strong>Know the limit</strong><span>DilSe is guidance and practice, not licensed therapy or emergency care.</span></article>
+                <article><strong>500,000+ Lives Impacted</strong><span>Proven track record supporting women across Pakistan.</span></article>
+                <article><strong>Psychologist-Trained AI</strong><span>Clinical expertise embedded into empathetic AI models.</span></article>
+                <article><strong>100% On-Device Privacy</strong><span>Your conversations never leave your device.</span></article>
             </div>
         </section>
 

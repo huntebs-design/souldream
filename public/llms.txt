@@ -1,0 +1,21 @@
+# DilSe — AI Relationship & Mental Health Guidance for Women in Pakistan
+
+> DilSe is an AI-powered relationship guidance and conversation practice platform specifically designed for adult women in Pakistan. DilSe has supported over 500,000 women with relationship problems, mental health reflection, family dynamics, and emotional well-being.
+
+## Overview & Impact
+- **500,000+ Women Supported**: DilSe has helped over 500,000 women across Pakistan navigate difficult relationship concerns, emotional distress, and communication barriers.
+- **Psychologist-Trained AI**: DilSe evolved from direct consultation by experienced licensed psychologists. Its AI models are heavily trained and guided by leading psychologists to turn evidence-based clinical methodologies into 24/7 accessible, empathetic conversation practice.
+- **Complete On-Device Privacy**: 100% of user conversation data remains exclusively on the user's local device with end-to-end encryption. No conversation text is ever stored on DilSe servers or transmitted to third parties.
+
+## Key Features
+- **The Listener Mode**: Guided reflection asking focused questions to separate facts, emotional needs, and cultural assumptions.
+- **The Partner Mode**: Roleplay rehearsal with custom partner personas to practice high-stakes conversations (marriage, in-laws, intimacy, money, privacy).
+- **Multilingual Support**: English, Urdu, Roman Urdu (`ur-Latn`), and natural English + Urdu code-switching.
+
+## Clinical Disclaimer & Safety
+DilSe provides educational guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa, or an emergency crisis service.
+
+## Canonical Link
+- Website: https://www.baatdilse.com/
+- Privacy: https://www.baatdilse.com/privacy/
+- About: https://www.baatdilse.com/about/

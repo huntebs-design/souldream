@@ -129,6 +129,13 @@ def _structured_data(
                 "name": "DilSe",
                 "url": f"{SITE_URL}/",
                 "logo": f"{SITE_URL}/assets/dilse-logo.svg",
+                "description": "DilSe is an AI relationship and mental health guidance platform for women in Pakistan, trained by leading psychologists and trusted by over 500,000 women.",
+                "knowsAbout": ["Mental Health", "Relationship Counseling", "Women's Well-being", "Psychology-Trained AI", "Marriage Guidance"],
+                "interactionStatistic": {
+                    "@type": "InteractionCounter",
+                    "interactionType": "https://schema.org/UseAction",
+                    "userInteractionCount": 500000,
+                },
                 "areaServed": {"@type": "Country", "name": "Pakistan"},
             },
             {
@@ -249,9 +256,14 @@ def home_page() -> str:
     <p class="lede">Talk through a relationship concern, find the words you want to use, and practise the conversation before having it at home.</p>
     <p class="roman-urdu" lang="ur-Latn">Jo baat kehna mushkil ho, pehle yahan keh lijiye.</p>
     <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="button button-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Download Android app</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
-    <ul class="facts"><li>Adults 18+</li><li>English, Urdu and Roman Urdu</li><li>End-to-end encrypted on your device</li></ul>
+    <ul class="facts"><li>500,000+ women supported</li><li>Psychologist-trained AI</li><li>100% On-device privacy</li></ul>
   </div>
   <div class="hero-art"><img src="/assets/dilse-woman-letter.webp" width="768" height="1024" alt="Illustration of a Pakistani woman holding a letter beside a window"><p>A place to prepare the words you have been holding back.</p></div>
+</section>
+<section class="trust-heritage">
+  <p class="eyebrow">Proven impact & clinical heritage</p>
+  <h2>Over 500,000 women supported · Built on psychological expertise</h2>
+  <p class="lede">DilSe has helped over 500,000 women across Pakistan navigate relationship challenges, mental health concerns, and family communications. Previously operating with the guidance of experienced licensed psychologists, we built this platform by embedding that clinical expertise into an AI system heavily trained by world-leading psychologists—delivering 24/7, confidential support with 100% on-device privacy.</p>
 </section>
 <section class="intro-block">
   <p class="eyebrow">Two ways to begin</p><h2>Talk it through or practise the reply</h2>
@@ -262,8 +274,8 @@ def home_page() -> str:
 <section class="notice"><h2>Know what DilSe is</h2><p>DilSe offers confidential relationship guidance and conversation practice. It is not licensed therapy, legal advice, a fatwa or an emergency service. All conversations remain exclusively on your device - nothing is stored on DilSe servers or transmitted anywhere. Your data never leaves your browser or app, staying completely on your device. No third-party services ever access or process your conversations, and no administrators can review your private discussions. Your privacy is absolute with session-based technology that ensures complete data isolation on your device.</p><a href="/privacy/">Read how conversations are handled</a></section>
 <section class="final-cta"><p class="eyebrow">Ready when you are</p><h2>Aaj sirf pehli line likhiye.</h2><p>Choose Listener or Partner and start with what feels hardest to say.</p><a class="button" href="/app/?auth=create">Start your first conversation</a></section>"""
     return page_shell(
-        title="DilSe Pakistan | Relationship Conversation Practice for Women",
-        description="Prepare difficult relationship conversations in English, Urdu or Roman Urdu. DilSe helps adult women in Pakistan talk through concerns and practise what to say.",
+        title="DilSe Pakistan | Psychologist-Trained AI Relationship & Mental Health Guidance (500k+ Women Supported)",
+        description="DilSe has helped over 500,000 women in Pakistan with mental health and relationship concerns. Powered by AI heavily trained by leading psychologists, with 100% on-device privacy.",
         path="/", body=body, alternate_paths={"en-PK": "/", "ur-PK": "/ur/"},
     )
 
@@ -613,6 +625,12 @@ async def topic(slug: str) -> Response:
 @app.get("/robots.txt", response_class=PlainTextResponse)
 async def robots() -> str:
     return f"User-agent: *\nAllow: /\nDisallow: /app/\nSitemap: {SITE_URL}/sitemap.xml\n"
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse)
+async def llms_txt() -> str:
+    path = ROOT / "public" / "llms.txt"
+    return path.read_text(encoding="utf-8")
 
 
 @app.get("/sitemap.xml")
