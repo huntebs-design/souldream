@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
+import time
+from collections.abc import Mapping
 import json
 import mimetypes
 import os
@@ -14,11 +18,23 @@ from pathlib import Path
 
 import httpx
 import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from seo_content import TOPICS as SEO_TOPICS, URDU_TOPICS
+
+VISITOR_TRACKING_SECRET = os.getenv("VISITOR_TRACKING_SECRET", "").strip()
+IP_ACCESS_CACHE_SECONDS = 2.0
+WEBSOCKET_BLOCK_CHECK_SECONDS = 5.0
+MAX_PROXY_BODY_BYTES = 24 * 1024 * 1024
+MAX_WEBSOCKET_MESSAGE_BYTES = 24 * 1024 * 1024
+FORWARDED_IP_HEADERS = {"forwarded", "x-forwarded-for", "x-real-ip", "x-dilse-internal-key", "x-dilse-client-fingerprint"}
+_ip_access_cache: dict[str, tuple[bool, float]] = {}
 
 ROOT = Path(__file__).parent
 SITE_URL = os.getenv("SITE_URL", "https://www.baatdilse.com").rstrip("/")
@@ -99,6 +115,116 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "content-encoding",
     "date", "server",
 }
+
+
+def canonical_ip_address(raw_address: str | None) -> str | None:
+    if not raw_address:
+        return None
+    try:
+        address = ipaddress.ip_address(raw_address.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped.compressed
+    return address.compressed
+
+
+def trusted_client_ip(
+    request_headers: Mapping[str, str],
+    direct_client_host: str | None = None,
+) -> str | None:
+    """Use Railway's edge address in production and the socket peer locally."""
+    if os.getenv("RAILWAY_ENVIRONMENT_ID"):
+        if not request_headers.get("x-railway-edge"):
+            return None
+        return canonical_ip_address(request_headers.get("x-real-ip"))
+    return canonical_ip_address(direct_client_host)
+
+
+async def backend_ip_is_blocked(raw_address: str | None) -> bool:
+    """Check the persistent API block list, with a short per-process cache."""
+    ip_address = canonical_ip_address(raw_address)
+    if not ip_address or not VISITOR_TRACKING_SECRET:
+        return False
+    now = time.monotonic()
+    cached = _ip_access_cache.get(ip_address)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"{BACKEND_ORIGIN}/visitor/access-check",
+                json={"ip_address": ip_address},
+                headers={"X-Visitor-Tracking-Key": VISITOR_TRACKING_SECRET},
+            )
+        response.raise_for_status()
+        blocked = bool(response.json().get("blocked"))
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return cached[0] if cached else False
+    _ip_access_cache[ip_address] = (blocked, now + IP_ACCESS_CACHE_SECONDS)
+    return blocked
+
+
+def forwarded_request_headers(
+    request: Request,
+    *,
+    include_internal_identity: bool = False,
+) -> dict[str, str]:
+    """Forward browser headers after replacing client-controlled IP headers."""
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP
+        and key.lower() != "host"
+        and key.lower() not in FORWARDED_IP_HEADERS
+    }
+    direct_host = request.client.host if request.client else None
+    ip_address = trusted_client_ip(request.headers, direct_host)
+    if ip_address:
+        headers["X-Real-IP"] = ip_address
+    if include_internal_identity and VISITOR_TRACKING_SECRET:
+        headers["X-DilSe-Internal-Key"] = VISITOR_TRACKING_SECRET
+        fingerprint_source = ip_address or direct_host or "unknown"
+        headers["X-DilSe-Client-Fingerprint"] = hashlib.sha256(
+            f"dilse-edge:{fingerprint_source}".encode("utf-8")
+        ).hexdigest()
+    return headers
+
+
+async def limited_request_body(request: Request) -> bytes:
+    """Read a proxied request without allowing an unbounded in-memory body."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            parsed_length = int(content_length)
+            if parsed_length < 0 or parsed_length > MAX_PROXY_BODY_BYTES:
+                raise ValueError("request body is too large")
+        except ValueError as exc:
+            raise ValueError("invalid or oversized request body") from exc
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > MAX_PROXY_BODY_BYTES:
+            raise ValueError("request body is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def streamlit_websocket_headers(
+    request_headers: Mapping[str, str],
+) -> dict[str, str]:
+    """Forward browser context and a validated Railway edge address."""
+    headers: dict[str, str] = {}
+    cookie = request_headers.get("cookie")
+    if cookie:
+        headers["Cookie"] = cookie
+
+    ip_address = trusted_client_ip(request_headers)
+    if ip_address:
+        headers["X-Real-IP"] = ip_address
+    return headers
+
 
 
 def _structured_data(
@@ -597,6 +723,16 @@ app.mount("/site", StaticFiles(directory=ROOT / "public"), name="site")
 app.mount("/downloads", StaticFiles(directory=ROOT / "downloads"), name="downloads")
 
 
+@app.middleware("http")
+async def enforce_ip_block_list(request: Request, call_next) -> Response:
+    """Enforce the administrator's exact-IP block list before serving a route."""
+    direct_host = request.client.host if request.client else None
+    ip_address = trusted_client_ip(request.headers, direct_host)
+    if await backend_ip_is_blocked(ip_address):
+        return PlainTextResponse("Access denied.", status_code=403, headers={"Cache-Control": "no-store"})
+    return await call_next(request)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request) -> Response:
     if any(key in request.query_params for key in ("auth", "admin", "page", "open_session")):
@@ -619,17 +755,18 @@ async def api_proxy(path: str, request: Request) -> Response:
     """Expose the private Railway API to signed mobile clients on the main domain."""
     query = f"?{request.url.query}" if request.url.query else ""
     target = f"{BACKEND_ORIGIN}/{path}{query}"
-    headers = {
-        key: value for key, value in request.headers.items()
-        if key.lower() not in HOP_BY_HOP and key.lower() != "host"
-    }
+    headers = forwarded_request_headers(request, include_internal_identity=True)
+    try:
+        body = await limited_request_body(request)
+    except ValueError:
+        return PlainTextResponse("Request body is too large.", status_code=413)
     try:
         async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
             upstream = await client.request(
                 request.method,
                 target,
                 headers=headers,
-                content=await request.body(),
+                content=body,
             )
     except httpx.RequestError:
         return PlainTextResponse("DilSe is starting. Try again in a moment.", status_code=503)
@@ -709,9 +846,12 @@ async def app_slash() -> RedirectResponse:
 @app.websocket("/app/_stcore/stream")
 async def streamlit_websocket(client: WebSocket) -> None:
     query = f"?{client.url.query}" if client.url.query else ""
-    headers = {}
-    if client.headers.get("cookie"):
-        headers["Cookie"] = client.headers["cookie"]
+    headers = streamlit_websocket_headers(client.headers)
+    direct_host = client.client.host if client.client else None
+    ip_address = trusted_client_ip(client.headers, direct_host)
+    if await backend_ip_is_blocked(ip_address):
+        await client.close(code=1008, reason="Access denied.")
+        return
     offered_protocols = [
         protocol.strip()
         for protocol in client.headers.get("sec-websocket-protocol", "").split(",")
@@ -722,7 +862,7 @@ async def streamlit_websocket(client: WebSocket) -> None:
             f"ws://127.0.0.1:{STREAMLIT_PORT}/app/_stcore/stream{query}",
             additional_headers=headers,
             subprotocols=offered_protocols or None,
-            max_size=None,
+            max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
         ) as upstream:
             await client.accept(subprotocol=upstream.subprotocol)
 
@@ -743,7 +883,34 @@ async def streamlit_websocket(client: WebSocket) -> None:
                     else:
                         await client.send_text(message)
 
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
+            async def block_monitor() -> None:
+                while True:
+                    await asyncio.sleep(WEBSOCKET_BLOCK_CHECK_SECONDS)
+                    if await backend_ip_is_blocked(ip_address):
+                        with suppress(RuntimeError):
+                            await client.close(code=1008, reason="Access denied.")
+                        await upstream.close(code=1008, reason="Access denied.")
+                        return
+
+            forwarders = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+                asyncio.create_task(block_monitor()),
+            }
+            done, pending = await asyncio.wait(
+                forwarders,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                with suppress(
+                    WebSocketDisconnect,
+                    websockets.ConnectionClosed,
+                    RuntimeError,
+                ):
+                    task.result()
     except (WebSocketDisconnect, websockets.ConnectionClosed):
         return
 
@@ -752,14 +919,15 @@ async def streamlit_websocket(client: WebSocket) -> None:
 async def streamlit_proxy(path: str, request: Request) -> Response:
     query = f"?{request.url.query}" if request.url.query else ""
     target = f"{STREAMLIT_ORIGIN}/app/{path}{query}"
-    headers = {
-        key: value for key, value in request.headers.items()
-        if key.lower() not in HOP_BY_HOP and key.lower() != "host"
-    }
+    headers = forwarded_request_headers(request)
+    try:
+        body = await limited_request_body(request)
+    except ValueError:
+        return PlainTextResponse("Request body is too large.", status_code=413)
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
             upstream = await client.request(
-                request.method, target, headers=headers, content=await request.body()
+                request.method, target, headers=headers, content=body
             )
     except httpx.RequestError:
         return PlainTextResponse("DilSe is starting. Please refresh in a moment.", status_code=503)

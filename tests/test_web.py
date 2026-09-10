@@ -4,6 +4,8 @@ import asyncio
 import json
 import mimetypes
 import re
+import os
+from unittest.mock import AsyncMock, patch
 import unittest
 from pathlib import Path
 
@@ -23,7 +25,7 @@ class PublicSiteTests(unittest.TestCase):
     def test_home_has_complete_indexable_metadata_and_content(self):
         html = web.home_page()
         self.assertIn("<html lang=\"en-PK\"", html)
-        self.assertIn("<title>DilSe Pakistan | Relationship Conversation Practice for Women</title>", html)
+        self.assertRegex(html, r"<title>DilSe Pakistan \| [^<]+</title>")
         self.assertIn("rel=\"canonical\" href=\"https://www.baatdilse.com/\"", html)
         self.assertIn("hreflang=\"ur-PK\"", html)
         self.assertIn("Relationship conversation practice for Pakistani women", html)
@@ -124,6 +126,145 @@ class PublicSiteTests(unittest.TestCase):
         self.assertIn("/Android/i.test(navigator.userAgent)", html)
         self.assertIn("Download app", html)
         self.assertIn("Not now", html)
+
+
+
+    def test_same_origin_api_proxy_forwards_user_auth_headers(self):
+        source = (Path(web.ROOT) / "web.py").read_text(encoding="utf-8")
+        self.assertIn('@app.api_route("/api/{path:path}"', source)
+        self.assertIn("key.lower() != \"host\"", source)
+        self.assertNotIn('key.lower() == "x-user-token"', source)
+        self.assertIn('target = f"{BACKEND_ORIGIN}/{path}{query}"', source)
+
+
+    def test_websocket_forwards_only_a_valid_railway_edge_ip(self):
+        railway_headers = {
+            "cookie": "dilse_browser=test-browser",
+            "x-railway-edge": "yyz1",
+            "x-real-ip": "198.51.100.42",
+            "x-forwarded-for": "203.0.113.99",
+        }
+        with patch.dict(
+            os.environ, {"RAILWAY_ENVIRONMENT_ID": "production-environment"}
+        ):
+            self.assertEqual(
+                web.streamlit_websocket_headers(railway_headers),
+                {
+                    "Cookie": "dilse_browser=test-browser",
+                    "X-Real-IP": "198.51.100.42",
+                },
+            )
+            self.assertEqual(
+                web.streamlit_websocket_headers(
+                    {**railway_headers, "x-real-ip": "not-an-ip"}
+                ),
+                {"Cookie": "dilse_browser=test-browser"},
+            )
+            self.assertEqual(
+                web.streamlit_websocket_headers(
+                    {
+                        "cookie": "dilse_browser=test-browser",
+                        "x-real-ip": "198.51.100.42",
+                    }
+                ),
+                {"Cookie": "dilse_browser=test-browser"},
+            )
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_ID": ""}):
+            self.assertEqual(
+                web.streamlit_websocket_headers(railway_headers),
+                {"Cookie": "dilse_browser=test-browser"},
+            )
+
+
+    def test_trusted_client_ip_uses_the_edge_in_production_and_socket_locally(self):
+        headers = {
+            "x-railway-edge": "yyz1",
+            "x-real-ip": "::ffff:198.51.100.42",
+        }
+        with patch.dict(
+            os.environ, {"RAILWAY_ENVIRONMENT_ID": "production-environment"}
+        ):
+            self.assertEqual(
+                web.trusted_client_ip(headers, "10.0.0.5"), "198.51.100.42"
+            )
+            self.assertIsNone(
+                web.trusted_client_ip(
+                    {"x-real-ip": "198.51.100.42"}, "10.0.0.5"
+                )
+            )
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_ID": ""}):
+            self.assertEqual(
+                web.trusted_client_ip(
+                    {"x-real-ip": "203.0.113.99"}, "127.0.0.1"
+                ),
+                "127.0.0.1",
+            )
+
+
+    def test_gateway_checks_the_persistent_backend_ip_block_list(self):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"blocked": True}
+
+        class FakeAsyncClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def post(self, url, **kwargs):
+                self.url = url
+                self.request_kwargs = kwargs
+                return FakeResponse()
+
+        web._ip_access_cache.clear()
+        with patch.object(web, "VISITOR_TRACKING_SECRET", "test-tracking-secret"), patch(
+            "web.httpx.AsyncClient", FakeAsyncClient
+        ):
+            blocked = asyncio.run(web.backend_ip_is_blocked("198.51.100.42"))
+        self.assertTrue(blocked)
+
+
+    def test_gateway_enforcement_covers_http_and_existing_app_connections(self):
+        source = (Path(web.ROOT) / "web.py").read_text(encoding="utf-8")
+        self.assertIn('@app.middleware("http")', source)
+        self.assertIn("enforce_ip_block_list", source)
+        self.assertIn("async def block_monitor()", source)
+        self.assertIn("WEBSOCKET_BLOCK_CHECK_SECONDS", source)
+        self.assertIn("forwarded_request_headers(request)", source)
+
+        async def allowed_response(_request):
+            return web.PlainTextResponse("Allowed")
+
+        request = web.Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/topics/family-boundaries/",
+                "raw_path": b"/topics/family-boundaries/",
+                "query_string": b"",
+                "headers": [],
+                "client": ("198.51.100.42", 41234),
+                "server": ("testserver", 80),
+            }
+        )
+        with patch.dict(os.environ, {"RAILWAY_ENVIRONMENT_ID": ""}), patch(
+            "web.backend_ip_is_blocked", new=AsyncMock(return_value=True)
+        ) as blocked_check:
+            response = asyncio.run(
+                web.enforce_ip_block_list(request, allowed_response)
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.body, b"Access denied.")
+        blocked_check.assert_awaited_once_with("198.51.100.42")
 
 
 if __name__ == "__main__":

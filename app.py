@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import html
 import json
@@ -20,6 +21,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
+from media_cache import store_bounded_media
+
 load_dotenv()
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
@@ -35,6 +38,8 @@ AI_REPLY_MIN_DELAY_SECONDS = max(
     0.0,
     min(float(os.getenv("DILSE_AI_REPLY_MIN_DELAY_SECONDS", "2.5")), 10.0),
 )
+USER_TRANSCRIPT_PAGE_SIZE = 30
+ADMIN_TRANSCRIPT_PAGE_SIZE = 30
 BROWSER_SESSION_SECONDS = int(os.getenv("AUTH_SESSION_DAYS", "7")) * 24 * 60 * 60
 BROWSER_COOKIE_NAME = "dilse_browser"
 CURRENT_TERMS_VERSION = "2026-08-10-terms-v6"
@@ -42,6 +47,40 @@ CHARACTER_PROFILE_MIN_LENGTH = 12
 CHARACTER_PROFILE_MAX_WORDS = 5_000
 CHARACTER_PROFILE_MAX_CHARS = 75_000
 ADMIN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+ADMIN_TTS_MAX_CHARACTERS = 600
+ACCOUNT_DELETION_REASONS = {
+    "Prefer not to say": "prefer_not_to_say",
+    "Privacy or trust concerns": "privacy_or_trust",
+    "The responses were not useful": "response_quality",
+    "I no longer need DilSe": "no_longer_needed",
+    "The app was difficult to use": "hard_to_use",
+    "The app was slow or unreliable": "slow_or_unreliable",
+    "Another reason": "other",
+}
+PREFERRED_TIME_SLOTS = {
+    "2:00 AM to 6:00 AM PKT": "early_morning",
+    "6:00 AM to 10:00 AM PKT": "morning",
+    "10:00 AM to 2:00 PM PKT": "midday",
+    "2:00 PM to 6:00 PM PKT": "afternoon",
+    "6:00 PM to 10:00 PM PKT": "evening",
+    "10:00 PM to 2:00 AM PKT": "late_evening",
+    "Flexible or varies": "flexible",
+}
+PREFERRED_TIME_SLOT_LABELS = {
+    value: label for label, value in PREFERRED_TIME_SLOTS.items()
+}
+MESSAGE_MEDIA_CACHE_MAX_BYTES = max(
+    1024 * 1024,
+    int(os.getenv("DILSE_MESSAGE_MEDIA_CACHE_MAX_BYTES", str(100 * 1024 * 1024))),
+)
+MESSAGE_MEDIA_CACHE_MAX_ITEMS = max(
+    1,
+    int(os.getenv("DILSE_MESSAGE_MEDIA_CACHE_MAX_ITEMS", "8")),
+)
+MESSAGE_MEDIA_MAX_OPEN_VOICE_NOTES = max(
+    1,
+    int(os.getenv("DILSE_MESSAGE_MEDIA_MAX_OPEN_VOICE_NOTES", "6")),
+)
 CHARACTER_PROFILE_GUIDANCE = {
     "husband": {
         "relationship": "your husband",
@@ -82,15 +121,12 @@ CHARACTER_PROFILE_GUIDANCE = {
 LANDING_IMAGE_PATH = Path(__file__).parent / "assets" / "dilse-woman-letter.webp"
 LOGO_PATH = Path(__file__).parent / "assets" / "dilse-logo.svg"
 CHAT_AVATAR_PATH = Path(__file__).parent / "assets" / "dilse-mark.svg"
-TYPING_CAPTURE_PATH = Path(__file__).parent / "components" / "typing_capture"
-typing_capture_component = components.declare_component(
-    "dilse_typing_capture",
-    path=str(TYPING_CAPTURE_PATH),
-)
 PHONE_ALERTS_PATH = Path(__file__).parent / "components" / "phone_alerts"
-phone_alerts_component = components.declare_component(
-    "dilse_phone_alerts",
-    path=str(PHONE_ALERTS_PATH),
+phone_alerts_component = components.declare_component("dilse_phone_alerts", path=str(PHONE_ALERTS_PATH))
+LEGACY_LIVE_UPDATES_PATH = Path(__file__).parent / "components" / "live_updates"
+_legacy_live_updates_component = components.declare_component(
+    "dilse_live_updates",
+    path=str(LEGACY_LIVE_UPDATES_PATH),
 )
 
 st.set_page_config(
@@ -136,6 +172,31 @@ st.markdown(
         min-height: 0 !important;
         margin: 0 !important;
         border: 0 !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stElementContainer"]:has(.dilse-browser-script-marker) {
+        display: none !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+    div[class*="st-key-transcript_history_"] {
+        position: absolute !important;
+        width: 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+    }
+    div[class*="st-key-user_chat_transport_"] {
+        position: absolute !important;
+        width: 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
         overflow: hidden !important;
     }
     .st-key-phone_alerts_widget [data-testid="stElementContainer"]:has(> [data-testid="stIFrame"]),
@@ -921,7 +982,7 @@ st.markdown(
     .admin-workspace-head p { max-width: 720px; margin: .45rem 0 0; color: #627772; font-size: .88rem; line-height: 1.55; }
     .admin-kpi-grid {
         display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(6, minmax(0, 1fr));
         gap: .7rem;
         margin: 0 0 1.45rem;
     }
@@ -1009,6 +1070,15 @@ st.markdown(
         font-size: .82rem;
         line-height: 1.55;
     }
+    .admin-waitlist-strip {
+        margin: .5rem 0 1rem;
+        padding: .85rem 1rem;
+        border-left: 3px solid #571f35;
+        background: #f8eaed;
+        color: #65404e;
+        font-size: .8rem;
+        line-height: 1.5;
+    }
     .admin-case-card h3 { margin: 0 0 .35rem; color: #264b47; font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif; font-size: .95rem; font-weight: 750; }
     .admin-case-card p { margin: 0; color: #72817e; font-size: .76rem; line-height: 1.5; }
     .admin-case-card .admin-case-message { margin-top: .55rem; color: #49383f; font-size: .84rem; }
@@ -1060,6 +1130,15 @@ st.markdown(
         box-shadow: 0 5px 14px rgba(23,63,59,.07);
     }
     .admin-user-typing strong { color: #214e49; font-size: .66rem; }
+    .st-key-admin_composer_presence {
+        position: relative;
+        z-index: 25;
+        width: fit-content;
+        margin: .12rem 0 -.45rem .15rem;
+    }
+    .st-key-admin_composer_presence .admin-user-typing {
+        margin: 0;
+    }
     .admin-typing-bubble {
         position: relative;
         display: inline-flex;
@@ -1229,14 +1308,168 @@ st.markdown(
         position: sticky;
         bottom: .55rem;
         z-index: 24;
-        margin: 1rem 0 .35rem;
-        padding: .85rem .9rem .75rem;
+        margin: .65rem 0 .25rem;
+        padding: .55rem .65rem .5rem;
         border: 1px solid #b9d1ca;
         border-bottom: 4px solid #245e58;
-        border-radius: 18px 18px 8px 8px;
+        border-radius: 14px 14px 7px 7px;
         background: rgba(247,251,249,.98);
         box-shadow: 0 14px 34px rgba(23,63,59,.16);
         backdrop-filter: blur(10px);
+    }
+    .st-key-user_unread_bar,
+    .st-key-admin_inbox_bar {
+        min-height: 0;
+        margin: 0 0 .35rem;
+    }
+    .st-key-user_unread_bar [data-testid="stPopover"],
+    .st-key-admin_inbox_bar [data-testid="stPopover"] {
+        width: fit-content;
+        margin-left: auto;
+    }
+    .st-key-user_unread_bar [data-testid="stPopover"] > button,
+    .st-key-admin_inbox_bar [data-testid="stPopover"] > button {
+        min-height: 34px;
+        padding: .3rem .72rem;
+        border-radius: 999px !important;
+        color: #fff !important;
+        font-size: .72rem !important;
+        font-weight: 820 !important;
+        white-space: nowrap;
+    }
+    .st-key-user_unread_bar [data-testid="stPopover"] > button,
+    .st-key-admin_inbox_bar:has(.admin-conversation-switcher-marker.urgent) [data-testid="stPopover"] > button {
+        border: 1px solid #a71f35 !important;
+        background: #c83245 !important;
+        box-shadow: 0 5px 13px rgba(132,25,45,.2);
+    }
+    .st-key-admin_inbox_bar [data-testid="stPopover"] > button {
+        border: 1px solid #1d5c55 !important;
+        background: #245e58 !important;
+        box-shadow: 0 5px 13px rgba(23,63,59,.18);
+    }
+    .st-key-user_unread_bar [data-testid="stPopover"] > button p,
+    .st-key-admin_inbox_bar [data-testid="stPopover"] > button p {
+        color: inherit !important;
+        font: inherit !important;
+    }
+    .unread-menu-item {
+        display: flex;
+        flex-direction: column;
+        gap: .12rem;
+        margin: .15rem 0 .35rem;
+        padding: .45rem .55rem;
+        border-left: 3px solid #c83245;
+        border-radius: 0 8px 8px 0;
+        background: #fff6f6;
+        color: #3f2b33;
+    }
+    .unread-menu-item strong {
+        color: #9e2338;
+        font-size: .75rem;
+        line-height: 1.3;
+    }
+    .unread-menu-item span {
+        color: #624d55;
+        font-size: .72rem;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+    }
+    .unread-menu-item.admin strong {
+        display: flex;
+        justify-content: space-between;
+        gap: .5rem;
+    }
+    .unread-menu-item.admin i {
+        flex: 0 0 auto;
+        color: #c83245;
+        font-size: .66rem;
+        font-style: normal;
+    }
+    .admin-conversation-switcher-marker { display: none; }
+    .admin-inbox-overview {
+        display: flex;
+        gap: .45rem;
+        margin: .1rem 0 .65rem;
+    }
+    .admin-inbox-overview span {
+        flex: 1 1 0;
+        padding: .48rem .55rem;
+        border: 1px solid #d7e4df;
+        border-radius: 9px;
+        background: #f5faf7;
+        color: #58706b;
+        font-size: .67rem;
+        line-height: 1.25;
+    }
+    .admin-inbox-overview b {
+        display: block;
+        margin-bottom: .08rem;
+        color: #214f4a;
+        font-size: .9rem;
+    }
+    .admin-inbox-overview span.needs-reply {
+        border-color: #edc8ce;
+        background: #fff5f6;
+        color: #8d4050;
+    }
+    .admin-inbox-overview span.needs-reply b { color: #a71f35; }
+    .admin-conversation-menu-item {
+        margin: .18rem 0 .32rem;
+        padding: .58rem .62rem;
+        border-left: 3px solid #4e8a82;
+        border-radius: 0 9px 9px 0;
+        background: #f4f9f6;
+    }
+    .admin-conversation-menu-item.unread {
+        border-left-color: #c83245;
+        background: #fff5f6;
+    }
+    .admin-conversation-menu-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: .65rem;
+    }
+    .admin-conversation-menu-title strong {
+        min-width: 0;
+        overflow-wrap: anywhere;
+        color: #2a4541;
+        font-size: .78rem;
+        line-height: 1.25;
+    }
+    .admin-conversation-menu-title b {
+        flex: 0 0 auto;
+        padding: .14rem .4rem;
+        border-radius: 999px;
+        background: #dfeee9;
+        color: #245e58;
+        font-size: .61rem;
+    }
+    .admin-conversation-menu-item.unread .admin-conversation-menu-title b {
+        background: #c83245;
+        color: #fff;
+    }
+    .admin-conversation-menu-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: .22rem;
+        margin-top: .3rem;
+    }
+    .admin-conversation-menu-meta span {
+        padding: .1rem .32rem;
+        border-radius: 5px;
+        background: rgba(36,94,88,.08);
+        color: #536e69;
+        font-size: .61rem;
+        line-height: 1.25;
+    }
+    .admin-conversation-menu-item p {
+        margin: .32rem 0 0;
+        color: #67545b;
+        font-size: .69rem;
+        line-height: 1.38;
+        overflow-wrap: anywhere;
     }
     .admin-writing-review {
         margin: .45rem 0 .8rem;
@@ -1268,16 +1501,92 @@ st.markdown(
         align-items: baseline;
         justify-content: space-between;
         gap: .75rem;
-        margin: 0 0 .55rem;
+        margin: 0 0 .3rem;
         color: #173f3b;
     }
     .admin-composer-label strong { font-size: .82rem; }
     .admin-composer-label span { color: #68817b; font-size: .66rem; }
+    .admin-voice-preview-title {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: .6rem;
+        margin: 0 0 .3rem;
+        color: #173f3b;
+    }
+    .admin-voice-preview-title strong { font-size: .84rem; }
+    .admin-voice-preview-title span { color: #68817b; font-size: .66rem; }
     .st-key-admin_chat_composer textarea {
         border-color: #c7d8d3 !important;
         border-radius: 15px !important;
         background: #fff !important;
         box-shadow: none !important;
+    }
+    .st-key-admin_chat_composer [data-testid="stVerticalBlock"] { gap: .4rem; }
+    .st-key-admin_composer_controls { margin: 0 0 .15rem; }
+    .st-key-admin_composer_controls [data-testid="stVerticalBlock"] { gap: .1rem; }
+    .st-key-admin_composer_controls [data-testid="stCaptionContainer"] {
+        margin: 0 0 -.15rem;
+        color: #68817b;
+        font-size: .62rem;
+        font-weight: 760;
+        letter-spacing: .045em;
+        text-transform: uppercase;
+    }
+    .st-key-admin_chat_composer .st-key-admin_composer_controls [data-testid="stRadio"] { margin: 0; }
+    .st-key-admin_chat_composer .st-key-admin_composer_controls [data-testid="stRadio"] > div {
+        gap: .18rem;
+        flex-wrap: nowrap;
+    }
+    .st-key-admin_chat_composer .st-key-admin_composer_controls [data-testid="stRadio"] label {
+        min-height: 30px;
+        margin: 0;
+        padding: .15rem .32rem;
+        font-size: .68rem;
+        white-space: nowrap;
+    }
+    .st-key-admin_chat_composer [data-testid="stForm"] {
+        border: 0;
+        padding: 0;
+    }
+    .st-key-admin_chat_composer [data-testid="stForm"] > [data-testid="stVerticalBlock"] {
+        gap: .35rem;
+    }
+    .st-key-admin_chat_composer [data-testid="stTextArea"] textarea {
+        min-height: 60px !important;
+    }
+    .st-key-admin_chat_composer [data-testid="stExpander"] details {
+        border-radius: 9px;
+    }
+    .st-key-admin_chat_composer [data-testid="stExpander"] summary {
+        min-height: 35px;
+        padding: .25rem .45rem;
+        font-size: .72rem;
+    }
+    .st-key-admin_chat_composer [data-testid="stFormSubmitButton"] button,
+    .st-key-admin_chat_composer .stButton button {
+        min-height: 35px;
+        padding: .32rem .55rem;
+        border-radius: 9px;
+        font-size: .72rem;
+    }
+    .st-key-admin_chat_composer [data-testid="stAudio"] { margin: 0; }
+    .st-key-admin_chat_composer [data-testid="stAudio"] audio { height: 40px; }
+    .st-key-admin_chat_composer [data-testid="stRadio"] {
+        margin: .15rem 0 .35rem;
+    }
+    .st-key-admin_chat_composer [data-testid="stRadio"] label {
+        min-height: 34px;
+        padding: .2rem .55rem;
+        font-size: .72rem;
+        font-weight: 700;
+    }
+    .st-key-admin_chat_composer [data-testid="stAudioInput"] {
+        margin: .15rem 0 .4rem;
+        padding: .5rem .6rem;
+        border: 1px solid #cadbd6;
+        border-radius: 13px;
+        background: #eef5f2;
     }
     .st-key-admin_chat_composer [data-testid="stFileUploaderDropzone"] {
         min-height: 0;
@@ -1297,6 +1606,63 @@ st.markdown(
         min-height: 32px;
         padding: 0;
         border-radius: 50%;
+    }
+    div[class*="st-key-open_voice_note_"] {
+        width: min(100%, 250px) !important;
+        margin: .28rem 0 .12rem;
+    }
+    div[class*="st-key-open_voice_note_"] .stButton button {
+        justify-content: flex-start;
+        width: 100%;
+        min-height: 40px;
+        padding: .38rem .68rem;
+        border: 1px solid #b9d1ca !important;
+        border-radius: 10px;
+        background: #eef5f2 !important;
+        color: #173f3b !important;
+        -webkit-text-fill-color: #173f3b !important;
+        box-shadow: 0 3px 9px rgba(23,63,59,.08);
+        font-size: .74rem;
+        font-weight: 780;
+    }
+    div[class*="st-key-open_voice_note_"] .stButton button:hover {
+        border-color: #7eaaa1 !important;
+        background: #f7fbf9 !important;
+    }
+    div[class*="st-key-open_voice_note_"] .stButton button p,
+    div[class*="st-key-open_voice_note_"] .stButton button span,
+    div[class*="st-key-open_voice_note_"] .stButton button svg,
+    div[class*="st-key-open_voice_note_"] .stButton button [data-testid="stIconMaterial"] {
+        color: #173f3b !important;
+        fill: currentColor !important;
+        -webkit-text-fill-color: #173f3b !important;
+    }
+    [data-testid="stChatMessageContent"] [data-testid="stAudio"] {
+        width: min(100%, 420px);
+        margin: .28rem 0 .08rem;
+    }
+    [data-testid="stChatMessageContent"] [data-testid="stAudio"] audio {
+        width: 100%;
+        height: 40px;
+    }
+    div[class*="st-key-close_voice_note_"] {
+        width: fit-content !important;
+        margin: .05rem 0 0;
+    }
+    div[class*="st-key-close_voice_note_"] .stButton button {
+        min-height: 26px;
+        padding: .08rem .35rem;
+        border: 0;
+        background: transparent;
+        box-shadow: none;
+        color: inherit;
+        font-size: .64rem;
+    }
+    @media (min-width: 901px) {
+        .block-container:has(.admin-shell-marker) [data-testid="stChatMessage"]:has(> [data-testid="stChatMessageContent"] div[class*="st-key-open_voice_note_"]),
+        .block-container:has(.admin-shell-marker) [data-testid="stChatMessage"]:has(> [data-testid="stChatMessageContent"] [data-testid="stAudio"]) {
+            width: min(78%, 680px);
+        }
     }
     div[class*="st-key-delete_message_"] {
         position: absolute;
@@ -1801,6 +2167,23 @@ st.markdown(
         line-height: 1.42;
     }
     .conversation-row-copy p { margin: 0; color: #826d75; font-size: .76rem; }
+    .conversation-unread {
+        display: inline-block;
+        margin-right: .35rem;
+        padding: .12rem .38rem;
+        border-radius: 999px;
+        background: #c83245;
+        color: #fff;
+        font-size: .62rem;
+        font-weight: 820;
+        line-height: 1.35;
+    }
+    div[class*="st-key-rail_unread_session_"] .stButton button {
+        border-color: #c83245 !important;
+        background: #fff6f6 !important;
+        color: #a71f35 !important;
+        font-weight: 800;
+    }
     .conversation-mode-chip {
         display: inline-block;
         margin-right: .4rem;
@@ -1919,6 +2302,81 @@ st.markdown(
     }
     .danger-zone h2 { margin: 0 0 .3rem; color: #812f46; font-size: 1.4rem; }
     .danger-zone p { margin: 0; color: #765e67; font-size: .84rem; line-height: 1.55; }
+    .deletion-confirmation {
+        max-width: 640px;
+        margin: 9vh auto 1rem;
+        padding: 2rem .35rem 1.2rem;
+        border-top: 4px solid #6c2945;
+    }
+    .deletion-confirmation .receipt-kicker {
+        color: #6c2945;
+        font-size: .7rem;
+        font-weight: 800;
+        letter-spacing: .11em;
+        text-transform: uppercase;
+    }
+    .deletion-confirmation h1 {
+        margin: .75rem 0 .8rem;
+        color: #30242a;
+        font-family: "Iowan Old Style", Georgia, serif;
+        font-size: clamp(2rem, 7vw, 3.2rem);
+        font-weight: 500;
+        line-height: 1.05;
+    }
+    .deletion-confirmation > p {
+        max-width: 590px;
+        color: #57474e;
+        font-size: .95rem;
+        line-height: 1.65;
+    }
+    .deletion-receipt {
+        margin: 1.4rem 0 1rem;
+        padding: .9rem 1rem;
+        border-left: 3px solid #245e58;
+        background: #eef4f2;
+    }
+    .deletion-receipt div { color: #395752; font-size: .8rem; line-height: 1.65; }
+    .deletion-scope { color: #68817b !important; font-size: .78rem !important; }
+    .st-key-account_deletion_return_home { max-width: 640px; margin: 0 auto; }
+    .waitlist-stage {
+        max-width: 680px;
+        margin: 8vh auto 1.5rem;
+        padding: 2rem .35rem 1.2rem;
+        border-top: 4px solid #571f35;
+    }
+    .waitlist-stage .waitlist-kicker {
+        color: #8b4961;
+        font-size: .7rem;
+        font-weight: 800;
+        letter-spacing: .11em;
+        text-transform: uppercase;
+    }
+    .waitlist-stage h1 {
+        max-width: 620px;
+        margin: .75rem 0 .8rem;
+        color: #30242a;
+        font-family: "Iowan Old Style", Georgia, serif;
+        font-size: clamp(2.15rem, 7vw, 3.65rem);
+        font-weight: 500;
+        line-height: 1.03;
+    }
+    .waitlist-stage > p {
+        max-width: 610px;
+        color: #57474e;
+        font-size: 1rem;
+        line-height: 1.68;
+    }
+    .waitlist-slot {
+        margin: 1.45rem 0 .65rem;
+        padding: .9rem 1rem;
+        border-left: 3px solid #245e58;
+        background: #eef4f2;
+        color: #395752;
+        font-size: .84rem;
+        line-height: 1.55;
+    }
+    .waitlist-stage .waitlist-foot { color: #72817e; font-size: .8rem; }
+    .st-key-waitlist_actions { max-width: 680px; margin: 0 auto; }
     .context-note {
         margin: .3rem 0 1rem;
         color: #765f68;
@@ -2278,6 +2736,18 @@ st.markdown(
     .chat-empty p { margin: 0; color: #79676e; font-size: .9rem; line-height: 1.55; }
     .chat-empty small { display: block; margin-top: .8rem; color: #9a6a7c; font-size: .75rem; }
     .partner-empty .empty-mark-dilse { background: #2d6d64; }
+    .st-key-user_chat_transcript {
+        justify-content: safe flex-end;
+    }
+    .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] {
+        height: 100% !important;
+        min-height: 100% !important;
+    }
+    .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] > [data-testid="stVerticalBlock"],
+    .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] > div > [data-testid="stVerticalBlock"] {
+        min-height: 100% !important;
+        justify-content: safe flex-end;
+    }
     div[data-testid="stHorizontalBlock"]:has(.dilse-app-shell-marker) > div[data-testid="stColumn"]:nth-child(2) [data-testid="stChatMessage"] {
         display: flex;
         align-items: flex-start;
@@ -2582,8 +3052,48 @@ st.markdown(
             bottom: auto;
             margin-bottom: .75rem;
             border-radius: 15px;
+            padding: .5rem;
         }
-        .admin-composer-label { align-items: flex-start; flex-direction: column; gap: .15rem; }
+        .admin-composer-label,
+        .admin-voice-preview-title { gap: .25rem; }
+        .admin-composer-label span,
+        .admin-voice-preview-title span { display: none; }
+        .st-key-admin_composer_controls [data-testid="stHorizontalBlock"] {
+            gap: .35rem;
+            flex-wrap: wrap;
+        }
+        .st-key-admin_composer_controls [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+            width: auto !important;
+            min-width: 0 !important;
+            flex: 1 1 100% !important;
+        }
+        .st-key-admin_chat_composer .st-key-admin_composer_controls [data-testid="stRadio"] label {
+            min-height: 44px;
+            padding: .15rem .3rem;
+            font-size: .8rem;
+        }
+        .st-key-admin_chat_composer .st-key-admin_composer_controls [data-testid="stRadio"] > div {
+            flex-wrap: wrap;
+        }
+        [data-testid="stVerticalBlock"][class*="st-key-admin_chat_transcript_"] {
+            height: auto !important;
+            max-height: 45dvh;
+            flex: 0 1 auto !important;
+            min-height: 0;
+        }
+        [data-testid="stLayoutWrapper"]:has(> [class*="st-key-admin_chat_transcript_"]) {
+            height: auto !important;
+            flex: 0 1 auto !important;
+        }
+        .st-key-admin_chat_composer [data-testid="stForm"] [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+            gap: .35rem;
+        }
+        .st-key-admin_chat_composer [data-testid="stForm"] [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+            width: calc(50% - .2rem) !important;
+            min-width: calc(50% - .2rem) !important;
+            flex: 1 1 calc(50% - .2rem) !important;
+        }
         div[data-testid="stHorizontalBlock"]:has(.admin-shell-marker) > div[data-testid="stColumn"] {
             width: 100% !important;
             min-width: 100% !important;
@@ -2931,6 +3441,136 @@ st.markdown(
         }
         div[data-testid="stHorizontalBlock"]:has(.dilse-app-shell-marker) [data-testid="stChatInput"] {
             padding: .75rem 0 calc(.25rem + env(safe-area-inset-bottom));
+        }
+        .block-container:has(.dilse-app-shell-marker) {
+            padding: 0 !important;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.dilse-app-shell-marker) > div[data-testid="stColumn"]:nth-child(2) {
+            padding: .2rem .55rem calc(.35rem + env(safe-area-inset-bottom));
+        }
+        .st-key-mobile_dashboard_nav {
+            min-height: 38px;
+            margin: 0 0 .28rem;
+            padding: .25rem;
+            border-width: 0 0 1px;
+            border-radius: 0;
+            box-shadow: none;
+        }
+        .st-key-mobile_dashboard_nav .stButton > button {
+            min-height: 32px !important;
+            padding: .2rem .45rem !important;
+            border-radius: 999px !important;
+            font-size: .64rem !important;
+        }
+        .chat-surface-header {
+            min-height: 38px;
+            margin: 0 0 .2rem;
+            padding: .22rem .15rem .35rem;
+        }
+        .chat-surface-header strong {
+            font-size: .78rem;
+        }
+        .chat-surface-header div > span {
+            display: none;
+        }
+        .st-key-mobile_conversation_controls {
+            justify-content: flex-end;
+            min-height: 34px;
+            margin: 0 0 .3rem;
+            padding: 0 0 .3rem;
+        }
+        .st-key-mobile_conversation_controls > [data-testid="stElementContainer"]:has(.mobile-mode-label) {
+            display: none;
+        }
+        .st-key-mobile_conversation_controls .stButton > button {
+            min-height: 29px !important;
+            padding: .12rem .5rem !important;
+            font-size: .62rem !important;
+        }
+        .st-key-user_chat_transcript {
+            height: clamp(330px, calc(100dvh - 225px), 640px) !important;
+            min-height: 290px !important;
+            max-height: 640px !important;
+            margin: 0;
+            justify-content: safe flex-end;
+        }
+        .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] {
+            height: 100% !important;
+            min-height: 100% !important;
+            max-height: 100% !important;
+        }
+        .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] > [data-testid="stVerticalBlock"],
+        .st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"] > div > [data-testid="stVerticalBlock"] {
+            min-height: 100% !important;
+            justify-content: safe flex-end;
+        }
+        .st-key-user_chat_transcript > [data-testid="stElementContainer"]:has(.dilse-chat-scroll-anchor),
+        .st-key-user_chat_transcript > [data-testid="stElementContainer"]:has(iframe) {
+            position: absolute !important;
+            width: 0 !important;
+            height: 0 !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+        }
+        div[class*="st-key-user_reply_message_"] {
+            display: none;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.dilse-app-shell-marker) > div[data-testid="stColumn"]:nth-child(2) [data-testid="stChatMessage"]:has(> [data-testid="stChatMessageContent"][aria-label="Chat message from user"]) {
+            max-width: 94%;
+        }
+        div[data-testid="stHorizontalBlock"]:has(.dilse-app-shell-marker) > div[data-testid="stColumn"]:nth-child(2) [data-testid="stChatMessage"]:has(> [data-testid="stChatMessageContent"][aria-label="Chat message from user"]) > [data-testid="stChatMessageAvatarCustom"] {
+            display: none;
+        }
+        .st-key-user_compact_composer {
+            position: sticky;
+            bottom: 0;
+            z-index: 26;
+            width: min(100%, 860px);
+            margin: 0 auto;
+            padding: .3rem 0 calc(.2rem + env(safe-area-inset-bottom));
+            background: linear-gradient(180deg, rgba(252,250,247,0), #fcfaf7 18%);
+        }
+        .st-key-user_compact_composer > [data-testid="stVerticalBlockBorderWrapper"],
+        .st-key-user_compact_composer [data-testid="stVerticalBlock"] {
+            position: relative;
+        }
+        .st-key-user_compact_composer [data-testid="stVerticalBlock"] {
+            gap: 0;
+        }
+        .st-key-user_compact_composer .st-key-user_voice_note_composer {
+            position: absolute;
+            bottom: calc(.5rem + env(safe-area-inset-bottom));
+            left: .38rem;
+            z-index: 4;
+            width: 38px;
+            margin: 0;
+        }
+        .st-key-user_compact_composer .st-key-user_voice_note_composer button {
+            width: 38px !important;
+            min-width: 38px !important;
+            min-height: 38px !important;
+            padding: 0 !important;
+            border: 0 !important;
+            border-radius: 50% !important;
+            background: transparent !important;
+            color: #6c2945 !important;
+            box-shadow: none !important;
+        }
+        .st-key-user_compact_composer .st-key-user_voice_note_composer button p {
+            display: none;
+        }
+        .st-key-user_compact_composer [data-testid="stChatInput"] {
+            position: static !important;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            background: transparent;
+        }
+        .st-key-user_compact_composer [data-testid="stChatInput"] textarea {
+            min-height: 48px;
+            padding-left: 3rem !important;
+            border-radius: 22px;
+            box-shadow: 0 6px 18px rgba(62,39,49,.07);
         }
     }
     /* Landing page: product-first editorial layout */
@@ -3333,18 +3973,28 @@ def initialize_state() -> None:
         "admin_selected_user_id": None,
         "admin_selected_session_id": None,
         "admin_navigation_restored": False,
+        "admin_navigation_target": None,
         "admin_pending_intervention": None,
         "admin_pending_message_delete": None,
+        "admin_pending_ip_unblock": None,
         "admin_reply_to": None,
         "admin_pending_roman_urdu_review": None,
+        "admin_pending_voice_preview": None,
+        "admin_new_chat_mode": "Listener",
         "admin_composer_nonces": {},
         "admin_composer_prefill": {},
         "admin_composer_retained_images": {},
+        "admin_transcript_cache": {},
         "auth_temporarily_unavailable": False,
+        "account_deletion_receipt": None,
         "page": "Talk",
         "session_id": uuid.uuid4().hex,
         "messages": [],
+        "user_transcript_total": 0,
+        "loaded_session_metadata": None,
         "message_attachment_cache": {},
+        "message_media_scope": None,
+        "loaded_voice_note_keys": [],
         "user_reply_to": None,
         "last_feedback": None,
         "last_message_id": 0,
@@ -3360,10 +4010,9 @@ def initialize_state() -> None:
         "carried_history": [],
         "transition_label": None,
         "conversation_checkpoint": None,
-        "typing_capture_event_ids": {},
+        "live_update_event_ids": {},
         "phone_alert_event_id": None,
         "opened_push_session": None,
-        "confirmed_read_receipts": {},
         "voice_recording_active": False,
         "voice_recording_pending_refresh": False,
         "voice_note_uploads": {},
@@ -3372,11 +4021,12 @@ def initialize_state() -> None:
         "pending_delete_session_id": None,
         "mobile_conversation_settings_open": False,
         "scroll_dashboard_top": False,
+        "scroll_chat_composer": False,
+        "v2_readiness_saved": {},
         "scroll_request_id": 0,
         "v2_partner_persona_slug": None,
         "v2_partner_persona_name": None,
         "v2_scenario_slug": "practice_opening_up",
-        "v2_readiness_saved": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -3389,6 +4039,15 @@ initialize_state()
 def uses_conversation_experience_v2() -> bool:
     user = st.session_state.get("user") or {}
     return int(user.get("experience_version") or 1) >= 2
+
+
+def is_mobile_browser() -> bool:
+    """Use the request user agent to avoid rendering secondary chat UI on phones."""
+    try:
+        user_agent = str(st.context.headers.get("User-Agent") or "")
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+    return bool(re.search(r"Android|iPhone|iPod|Mobile", user_agent, re.IGNORECASE))
 
 
 @st.cache_resource
@@ -3413,12 +4072,25 @@ def browser_session_key() -> str | None:
     return hashlib.sha256(f"dilse-browser:{identity}".encode("utf-8")).hexdigest()
 
 
+def internal_client_headers() -> dict[str, str]:
+    """Identify one browser to the private API without exposing its raw cookie."""
+    if not VISITOR_TRACKING_SECRET:
+        return {}
+    headers = {"X-DilSe-Internal-Key": VISITOR_TRACKING_SECRET}
+    identity = browser_identity()
+    if identity:
+        headers["X-DilSe-Client-Fingerprint"] = hashlib.sha256(
+            f"dilse-browser:{identity}".encode("utf-8")
+        ).hexdigest()
+    return headers
+
+
 def register_browser_identity(identity: str, token: str) -> None:
     try:
         requests.post(
             f"{BACKEND_URL}/auth/browser-session",
             json={"browser_id": identity},
-            headers={"X-User-Token": token},
+            headers={**internal_client_headers(), "X-User-Token": token},
             timeout=10,
         )
     except requests.RequestException:
@@ -3444,13 +4116,12 @@ def ensure_browser_identity() -> None:
         f"{BROWSER_COOKIE_NAME}={identity}; Max-Age={BROWSER_SESSION_SECONDS}; "
         f"Path=/; SameSite=Strict{secure}"
     )
-    components.html(
-        f"""<script>
+    st.html(
+        f"""<span class="dilse-browser-script-marker" hidden></span><script>
         window.parent.document.cookie = {json.dumps(cookie)};
         window.setTimeout(() => window.parent.location.reload(), 80);
         </script>""",
-        height=0,
-        width=0,
+        unsafe_allow_javascript=True,
     )
     st.caption("Preparing your private DilSe space…")
     st.stop()
@@ -3481,7 +4152,7 @@ def restore_browser_login() -> str | None:
     try:
         response = requests.post(
             f"{BACKEND_URL}/auth/browser-session/restore",
-            headers={"X-Browser-Session": identity},
+            headers={**internal_client_headers(), "X-Browser-Session": identity},
             timeout=10,
         )
     except requests.RequestException:
@@ -3502,7 +4173,7 @@ def forget_browser_login() -> None:
         try:
             requests.delete(
                 f"{BACKEND_URL}/auth/browser-session",
-                headers={"X-Browser-Session": identity},
+                headers={**internal_client_headers(), "X-Browser-Session": identity},
                 timeout=10,
             )
         except requests.RequestException:
@@ -3517,7 +4188,7 @@ def remember_admin_browser_login(admin_key: str) -> bool:
         response = requests.post(
             f"{BACKEND_URL}/admin/browser-session",
             json={"browser_id": identity},
-            headers={"X-Admin-Key": admin_key},
+            headers={**internal_client_headers(), "X-Admin-Key": admin_key},
             timeout=10,
         )
     except requests.RequestException:
@@ -3538,7 +4209,10 @@ def restore_admin_browser_login() -> bool:
     try:
         response = requests.post(
             f"{BACKEND_URL}/admin/browser-session/restore",
-            headers={"X-Admin-Browser-Session": identity},
+            headers={
+                **internal_client_headers(),
+                "X-Admin-Browser-Session": identity,
+            },
             timeout=10,
         )
     except requests.RequestException:
@@ -3555,7 +4229,10 @@ def forget_admin_browser_login() -> None:
         try:
             requests.delete(
                 f"{BACKEND_URL}/admin/browser-session",
-                headers={"X-Admin-Browser-Session": identity},
+                headers={
+                    **internal_client_headers(),
+                    "X-Admin-Browser-Session": identity,
+                },
                 timeout=10,
             )
         except requests.RequestException:
@@ -3616,7 +4293,7 @@ def request_api(
     admin: bool = False,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> requests.Response:
-    headers: dict[str, str] = {}
+    headers = internal_client_headers()
     if auth and st.session_state.auth_token:
         headers["X-User-Token"] = st.session_state.auth_token
     if admin:
@@ -3701,6 +4378,11 @@ def format_session_activity(value: Any) -> str:
 def reset_local_conversation() -> None:
     st.session_state.session_id = uuid.uuid4().hex
     st.session_state.messages = []
+    st.session_state.user_transcript_total = 0
+    st.session_state.loaded_session_metadata = None
+    st.session_state.message_attachment_cache = {}
+    st.session_state.message_media_scope = None
+    st.session_state.loaded_voice_note_keys = []
     st.session_state.user_reply_to = None
     st.session_state.pending_prompt = None
     st.session_state.mode = "The Listener"
@@ -3716,7 +4398,6 @@ def reset_local_conversation() -> None:
     st.session_state.carried_history = []
     st.session_state.transition_label = None
     st.session_state.conversation_checkpoint = None
-    st.session_state.confirmed_read_receipts = {}
     st.session_state.voice_recording_active = False
     st.session_state.voice_recording_pending_refresh = False
     st.session_state.voice_note_uploads = {}
@@ -3731,6 +4412,7 @@ def reset_local_conversation() -> None:
     st.session_state.pop("roleplay_scenario_name", None)
     st.session_state.page = "Talk"
     st.session_state.main_navigation = "Talk"
+    st.session_state.scroll_chat_composer = False
     st.session_state.scroll_dashboard_top = True
     st.session_state.scroll_request_id += 1
 
@@ -3769,10 +4451,35 @@ def switch_conversation_mode(target_mode: str) -> None:
     st.session_state.transition_label = f"Continuing from {previous_mode} in a new {target_mode} conversation."
 
 
+def user_message_from_api(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "role": item["role"],
+        "content": item["content"],
+        "source": item.get("source"),
+        "message_id": item.get("id"),
+        "reply_to_message_id": item.get("reply_to_message_id"),
+        "reply_to_role": item.get("reply_to_role"),
+        "reply_to_content": item.get("reply_to_content"),
+        "reply_to_source": item.get("reply_to_source"),
+        "attachment_id": item.get("attachment_id"),
+        "attachment_filename": item.get("attachment_filename"),
+        "attachment_mime_type": item.get("attachment_mime_type"),
+        "attachment_size_bytes": item.get("attachment_size_bytes"),
+        "voice_note_id": item.get("voice_note_id"),
+        "voice_note_filename": item.get("voice_note_filename"),
+        "voice_note_mime_type": item.get("voice_note_mime_type"),
+        "voice_note_size_bytes": item.get("voice_note_size_bytes"),
+        "voice_note_duration_seconds": item.get("voice_note_duration_seconds"),
+    }
+
+
 def load_saved_conversation(session: dict[str, Any]) -> None:
     try:
         response = request_api(
-            "GET", f"/sessions/{session['session_id']}/messages", auth=True, timeout=15
+            "GET",
+            f"/sessions/{session['session_id']}/messages?limit={USER_TRANSCRIPT_PAGE_SIZE}",
+            auth=True,
+            timeout=15,
         )
         if response.status_code != 200:
             st.error(error_detail(response))
@@ -3782,28 +4489,12 @@ def load_saved_conversation(session: dict[str, Any]) -> None:
         st.error("DilSe could not load this conversation.")
         return
     st.session_state.session_id = session["session_id"]
-    st.session_state.messages = [
-        {
-            "role": item["role"],
-            "content": item["content"],
-            "source": item.get("source"),
-            "message_id": item.get("id"),
-            "reply_to_message_id": item.get("reply_to_message_id"),
-            "reply_to_role": item.get("reply_to_role"),
-            "reply_to_content": item.get("reply_to_content"),
-            "reply_to_source": item.get("reply_to_source"),
-            "attachment_id": item.get("attachment_id"),
-            "attachment_filename": item.get("attachment_filename"),
-            "attachment_mime_type": item.get("attachment_mime_type"),
-            "attachment_size_bytes": item.get("attachment_size_bytes"),
-            "voice_note_id": item.get("voice_note_id"),
-            "voice_note_filename": item.get("voice_note_filename"),
-            "voice_note_mime_type": item.get("voice_note_mime_type"),
-            "voice_note_size_bytes": item.get("voice_note_size_bytes"),
-            "voice_note_duration_seconds": item.get("voice_note_duration_seconds"),
-        }
-        for item in stored_messages
-    ]
+    st.session_state.user_transcript_total = max(
+        int(session.get("message_count") or 0),
+        len(stored_messages),
+    )
+    st.session_state.loaded_session_metadata = dict(session)
+    st.session_state.messages = [user_message_from_api(item) for item in stored_messages]
     st.session_state.user_reply_to = None
     st.session_state.last_message_id = max((int(item["id"]) for item in stored_messages), default=0)
     mode_label = "The Partner" if session.get("mode") == "partner" else "The Listener"
@@ -3829,8 +4520,102 @@ def load_saved_conversation(session: dict[str, Any]) -> None:
     st.session_state.conversation_checkpoint = None
     st.session_state.page = "Talk"
     st.session_state.main_navigation = "Talk"
-    st.session_state.scroll_dashboard_top = True
+    st.session_state.scroll_chat_composer = True
+    st.session_state.scroll_dashboard_top = False
     st.session_state.scroll_request_id += 1
+
+
+def open_user_unread_conversation(session_id: str) -> None:
+    try:
+        response = request_api("GET", "/sessions", auth=True, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException:
+        st.error("The conversation could not be opened. Try again.")
+        return
+    session = next(
+        (
+            item
+            for item in response.json()
+            if str(item.get("session_id") or "") == session_id
+        ),
+        None,
+    )
+    if session is None:
+        st.error("This conversation is no longer available.")
+        return
+    load_saved_conversation(session)
+    st.rerun(scope="app")
+
+
+@st.fragment(run_every="5s")
+def render_user_unread_bubble() -> None:
+    if not st.session_state.user.get("store_chats"):
+        return
+    try:
+        response = request_api("GET", "/sessions/unread", auth=True, timeout=8)
+    except requests.RequestException:
+        return
+    if response.status_code != 200:
+        return
+    inbox = response.json()
+    total_unread = int(inbox.get("total_unread") or 0)
+    conversations = list(inbox.get("conversations") or [])
+    if total_unread <= 0 or not conversations:
+        return
+    label = "1 new message" if total_unread == 1 else f"{total_unread} new messages"
+    with st.container(key="user_unread_bar"):
+        with st.popover(label):
+            st.caption("New replies")
+            for conversation in conversations:
+                session_id = str(conversation.get("session_id") or "")
+                unread_count = int(conversation.get("unread_count") or 0)
+                preview = " ".join(
+                    str(conversation.get("latest_message_preview") or "New message").split()
+                )
+                if len(preview) > 90:
+                    preview = f"{preview[:87].rstrip()}…"
+                st.markdown(
+                    f'<div class="unread-menu-item"><strong>{unread_count} new</strong>'
+                    f'<span>{html.escape(preview)}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "Open conversation",
+                    key=f"open_user_unread_{session_id}",
+                    width="stretch",
+                ):
+                    open_user_unread_conversation(session_id)
+
+
+def load_earlier_user_messages(before_id: int) -> bool:
+    try:
+        response = request_api(
+            "GET",
+            f"/sessions/{st.session_state.session_id}/messages"
+            f"?limit={USER_TRANSCRIPT_PAGE_SIZE}&before_id={before_id}",
+            auth=True,
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return False
+        older_messages = response.json()
+    except requests.RequestException:
+        return False
+    known_ids = {
+        int(item["message_id"])
+        for item in st.session_state.messages
+        if item.get("message_id")
+    }
+    page = [
+        user_message_from_api(item)
+        for item in older_messages
+        if int(item["id"]) not in known_ids
+    ]
+    if not page:
+        st.session_state.user_transcript_total = len(known_ids)
+        return False
+    st.session_state.messages = [*page, *st.session_state.messages]
+    return True
 
 
 def open_requested_push_conversation() -> None:
@@ -3868,6 +4653,101 @@ def sign_out() -> None:
     st.session_state.auth_token = None
     st.session_state.user = None
     reset_local_conversation()
+
+
+def complete_account_deletion(response: requests.Response) -> None:
+    receipt = dict(response.json())
+    forget_browser_login()
+    st.session_state.auth_token = None
+    st.session_state.user = None
+    reset_local_conversation()
+    st.session_state.account_deletion_receipt = receipt
+
+
+def render_account_deletion_confirmation(receipt: dict[str, Any]) -> None:
+    email_status = (
+        "A copy of this confirmation was sent to your email address."
+        if receipt.get("email_sent")
+        else "The account was deleted, but the confirmation email could not be delivered. Keep this reference for your records."
+    )
+    st.markdown(
+        f"""
+        <main class="deletion-confirmation">
+            <div class="receipt-kicker">Deletion complete</div>
+            <h1>Your DilSe account has been deleted.</h1>
+            <p>Your profile, stored conversations, voice notes, consent records, feedback, and active sign-in sessions were removed from the live DilSe service. The deleted account can no longer be used to sign in.</p>
+            <div class="deletion-receipt">
+                <div><strong>Reason selected:</strong> {html.escape(str(receipt.get("departure_reason") or "Prefer not to say"))}</div>
+                <div><strong>Completed:</strong> {html.escape(format_session_activity(receipt.get("deleted_at")))}</div>
+                <div><strong>Reference:</strong> {html.escape(str(receipt.get("confirmation_reference") or "Unavailable"))}</div>
+            </div>
+            <p>{html.escape(email_status)}</p>
+            <p class="deletion-scope">This receipt covers the live DilSe service. Historical protected backups, when present, and temporary records held by service providers follow their separate retention processes.</p>
+        </main>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button(
+        "Return to DilSe",
+        type="primary",
+        width="stretch",
+        key="account_deletion_return_home",
+    ):
+        st.session_state.account_deletion_receipt = None
+        st.rerun()
+
+
+def render_waitlist() -> None:
+    user = st.session_state.user or {}
+    logo_uri = image_data_uri(str(LOGO_PATH), LOGO_PATH.stat().st_mtime_ns)
+    slot = PREFERRED_TIME_SLOT_LABELS.get(
+        str(user.get("preferred_time_slot") or "flexible"),
+        PREFERRED_TIME_SLOT_LABELS["flexible"],
+    )
+    st.markdown(
+        f"""
+        <header class="site-masthead">
+            <img class="site-logo" src="{logo_uri}" alt="DilSe, from the heart">
+        </header>
+        <main class="waitlist-stage">
+            <div class="waitlist-kicker">Limited access</div>
+            <h1>Your account is on the DilSe waitlist.</h1>
+            <p>Access is currently limited, so new accounts are activated gradually. Check back in a few hours. We will also email you as soon as your account is active.</p>
+            <div class="waitlist-slot"><strong>Your preferred time</strong><br>{html.escape(slot)}</div>
+            <p class="waitlist-foot">Your preferred time helps DilSe plan response coverage. It does not guarantee access at that time.</p>
+        </main>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="waitlist_actions"):
+        refresh_col, sign_out_col = st.columns([1.35, 1])
+        with refresh_col:
+            if st.button(
+                "Check access again",
+                type="primary",
+                width="stretch",
+                key="waitlist_refresh",
+            ):
+                try:
+                    response = request_api("GET", "/auth/me", auth=True, timeout=10)
+                    if response.status_code == 200:
+                        st.session_state.user = response.json()
+                        if st.session_state.user.get("access_status") == "active":
+                            st.toast("Your DilSe account is active")
+                            st.rerun()
+                        st.info("Your account is still on the waitlist. Please check again in a few hours.")
+                    else:
+                        st.error(error_detail(response))
+                except requests.RequestException:
+                    st.error("DilSe could not check access right now. Try again shortly.")
+        with sign_out_col:
+            if st.button(
+                "Sign out",
+                width="stretch",
+                key="waitlist_sign_out",
+            ):
+                sign_out()
+                st.rerun()
 
 
 def load_user() -> bool:
@@ -3980,38 +4860,50 @@ def render_terms_update() -> None:
                         st.error(error_detail(response))
                 except requests.RequestException:
                     st.error("DilSe could not save your acceptance. Check your connection and try again.")
-        if st.button("Sign out", use_container_width=True, key="terms_update_sign_out"):
+        if st.button("Sign out", width="stretch", key="terms_update_sign_out"):
             sign_out()
             st.rerun()
         with st.expander("Delete my account instead"):
-            st.caption("This permanently removes the account and its stored conversations. It cannot be undone.")
+            st.caption("This removes your account and stored data from the live DilSe service. It cannot be undone.")
             with st.form("terms_update_delete_account_form"):
-                password = st.text_input("Password", type="password", autocomplete="current-password")
-                confirm_delete = st.checkbox("I understand that this permanently deletes my account and stored data.")
+                reason_label = st.selectbox(
+                    "Why are you leaving? (optional)",
+                    list(ACCOUNT_DELETION_REASONS),
+                    key="terms_update_deletion_reason",
+                )
+                password = st.text_input(
+                    "Password",
+                    type="password",
+                    autocomplete="current-password",
+                )
+                confirm_phrase = st.text_input(
+                    "Type DELETE to confirm",
+                    key="terms_update_deletion_phrase",
+                )
                 delete_submitted = st.form_submit_button(
                     "Delete account permanently",
-                    use_container_width=True,
+                    width="stretch",
+                    disabled=confirm_phrase.strip() != "DELETE" or not password,
                 )
             if delete_submitted:
-                if not confirm_delete:
-                    st.warning("Confirm permanent deletion before continuing.")
-                else:
-                    try:
-                        response = request_api(
-                            "DELETE",
-                            "/account",
-                            {"password": password},
-                            auth=True,
-                            timeout=20,
-                        )
-                        if response.status_code == 204:
-                            sign_out()
-                            st.success("Your account and stored data were deleted.")
-                            st.rerun()
-                        else:
-                            st.error(error_detail(response))
-                    except requests.RequestException:
-                        st.error("DilSe could not delete the account. Check your connection and try again.")
+                try:
+                    response = request_api(
+                        "DELETE",
+                        "/account",
+                        {
+                            "password": password,
+                            "departure_reason": ACCOUNT_DELETION_REASONS[reason_label],
+                        },
+                        auth=True,
+                        timeout=20,
+                    )
+                    if response.status_code == 200:
+                        complete_account_deletion(response)
+                        st.rerun()
+                    else:
+                        st.error(error_detail(response))
+                except requests.RequestException:
+                    st.error("DilSe could not delete the account. Check your connection and try again.")
 
 
 def render_auth() -> None:
@@ -4204,11 +5096,19 @@ def render_auth() -> None:
                 password = st.text_input("Password", type="password", key="register_password", help="Use at least 10 characters.")
                 country = st.selectbox("Country", ["Pakistan"])
                 language = st.selectbox("Preferred language", ["English", "Urdu", "Roman Urdu", "English and Urdu"])
+                preferred_time_label = st.selectbox(
+                    "When would you usually use DilSe?",
+                    list(PREFERRED_TIME_SLOTS),
+                    help="All times are Pakistan Standard Time (PKT).",
+                )
+                st.caption(
+                    "Access is opened gradually. Your preferred time helps DilSe plan response coverage, but it does not guarantee access at that time."
+                )
                 st.markdown("Read the [Terms and Conditions](?page=terms), including the privacy and AI-processing details.")
                 terms = st.checkbox(
                     "I Agree with the Terms and Conditions"
                 )
-                submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
+                submitted = st.form_submit_button("Create account", type="primary", width="stretch")
             if submitted:
                 payload = {
                     "display_name": display_name,
@@ -4216,6 +5116,7 @@ def render_auth() -> None:
                     "password": password,
                     "language": language,
                     "country": country,
+                    "preferred_time_slot": PREFERRED_TIME_SLOTS[preferred_time_label],
                     "terms_accepted": terms,
                 }
                 try:
@@ -4295,6 +5196,49 @@ def clickable_admin_message(value: str) -> str:
     return "".join(pieces).replace("\n", "  \n")
 
 
+def set_message_media_scope(scope: str) -> None:
+    """Release media bytes when the browser moves to another conversation."""
+    if st.session_state.get("message_media_scope") == scope:
+        return
+    st.session_state.message_attachment_cache = {}
+    st.session_state.loaded_voice_note_keys = []
+    st.session_state.message_media_scope = scope
+
+
+def cache_message_media(cache_key: str, content: bytes | None) -> None:
+    store_bounded_media(
+        st.session_state.message_attachment_cache,
+        cache_key,
+        content,
+        max_bytes=MESSAGE_MEDIA_CACHE_MAX_BYTES,
+        max_items=MESSAGE_MEDIA_CACHE_MAX_ITEMS,
+    )
+
+
+def open_voice_note(cache_key: str) -> None:
+    open_keys = [
+        key
+        for key in st.session_state.get("loaded_voice_note_keys", [])
+        if key != cache_key
+    ]
+    open_keys.append(cache_key)
+    evicted_keys = open_keys[:-MESSAGE_MEDIA_MAX_OPEN_VOICE_NOTES]
+    for evicted_key in evicted_keys:
+        st.session_state.message_attachment_cache.pop(evicted_key, None)
+    st.session_state.loaded_voice_note_keys = open_keys[
+        -MESSAGE_MEDIA_MAX_OPEN_VOICE_NOTES:
+    ]
+
+
+def close_voice_note(cache_key: str) -> None:
+    st.session_state.loaded_voice_note_keys = [
+        key
+        for key in st.session_state.get("loaded_voice_note_keys", [])
+        if key != cache_key
+    ]
+    st.session_state.message_attachment_cache.pop(cache_key, None)
+
+
 def render_message_attachment(message: dict[str, Any], *, viewer: str) -> None:
     attachment_id = message.get("attachment_id")
     message_id = message.get("message_id") or message.get("id")
@@ -4316,15 +5260,18 @@ def render_message_attachment(message: dict[str, Any], *, viewer: str) -> None:
                 admin=viewer == "admin",
                 timeout=20,
             )
-            cache[cache_key] = response.content if response.status_code == 200 else None
+            cache_message_media(
+                cache_key,
+                response.content if response.status_code == 200 else None,
+            )
         except requests.RequestException:
-            cache[cache_key] = None
+            cache_message_media(cache_key, None)
     image_content = cache.get(cache_key)
     if image_content:
         st.image(
             image_content,
             caption=str(message.get("attachment_filename") or "Shared image"),
-            use_container_width=True,
+            width="stretch",
         )
     else:
         st.caption("The attached image is temporarily unavailable.")
@@ -4336,6 +5283,21 @@ def render_message_voice_note(message: dict[str, Any], *, viewer: str) -> None:
     if not voice_note_id or not message_id:
         return
     cache_key = f"voice:{viewer}:{message_id}:{voice_note_id}"
+    duration = float(message.get("voice_note_duration_seconds") or 0)
+    duration_label = ""
+    if duration:
+        minutes, seconds = divmod(int(round(duration)), 60)
+        duration_label = f" · {minutes}:{seconds:02d}"
+
+    if cache_key not in st.session_state.get("loaded_voice_note_keys", []):
+        if not st.button(
+            f"Play voice note{duration_label}",
+            icon=":material/play_arrow:",
+            key=f"open_voice_note_{viewer}_{message_id}_{voice_note_id}",
+        ):
+            return
+        open_voice_note(cache_key)
+
     cache = st.session_state.message_attachment_cache
     if cache_key not in cache:
         path = (
@@ -4351,31 +5313,39 @@ def render_message_voice_note(message: dict[str, Any], *, viewer: str) -> None:
                 admin=viewer == "admin",
                 timeout=30,
             )
-            cache[cache_key] = response.content if response.status_code == 200 else None
+            audio_content = response.content if response.status_code == 200 else None
+            cache_message_media(cache_key, audio_content)
         except requests.RequestException:
-            cache[cache_key] = None
-    audio_content = cache.get(cache_key)
+            audio_content = None
+            cache_message_media(cache_key, None)
+    else:
+        audio_content = cache.get(cache_key)
     if audio_content:
         st.audio(
             audio_content,
             format=str(message.get("voice_note_mime_type") or "audio/wav"),
         )
-        duration = float(message.get("voice_note_duration_seconds") or 0)
-        if duration:
-            minutes, seconds = divmod(int(round(duration)), 60)
-            st.caption(f"Voice note · {minutes}:{seconds:02d}")
+        if st.button(
+            "Close voice note",
+            key=f"close_voice_note_{viewer}_{message_id}_{voice_note_id}",
+        ):
+            close_voice_note(cache_key)
+            st.rerun()
     else:
-        st.caption("The voice note is temporarily unavailable.")
+        close_voice_note(cache_key)
+        st.caption("The voice note is temporarily unavailable. Select play to try again.")
 
 
 def render_message_body(message: dict[str, Any], *, viewer: str) -> None:
     content = str(message.get("content") or "")
-    if content:
+    if content and not (content == "Voice note" and message.get("voice_note_id")):
         if message.get("source") == "admin":
             st.markdown(clickable_admin_message(content))
         else:
             st.markdown(content)
     render_message_attachment(message, viewer=viewer)
+    if message.get("source") == "admin" and message.get("voice_note_id"):
+        st.caption("AI-generated voice")
     render_message_voice_note(message, viewer=viewer)
 
 
@@ -4466,6 +5436,21 @@ def send_chat(
                         "notice": waiting_for_admin,
                         "message_id": result.get("message_id"),
                     }
+                )
+            stored_delta = int(bool(result.get("user_message_id"))) + int(
+                bool(result.get("message_id"))
+            )
+            if stored_delta:
+                st.session_state.user_transcript_total = max(
+                    int(st.session_state.get("user_transcript_total") or 0)
+                    + stored_delta,
+                    len(
+                        [
+                            item
+                            for item in st.session_state.messages
+                            if item.get("message_id")
+                        ]
+                    ),
                 )
         else:
             st.session_state.messages.append({"role": "assistant", "content": error_detail(response), "error": True})
@@ -4561,9 +5546,10 @@ def send_user_voice_note(
                 "reply_to_source": reply_target.get("source"),
             }
         )
-    st.session_state.message_attachment_cache[
-        f"voice:user:{message_id}:{voice_note_id}"
-    ] = audio_content
+    cache_message_media(
+        f"voice:user:{message_id}:{voice_note_id}",
+        audio_content,
+    )
     if not any(
         int(item.get("message_id") or -1) == message_id
         for item in st.session_state.messages
@@ -4572,6 +5558,10 @@ def send_user_voice_note(
     voice_note_uploads[upload_id] = "sent"
     st.session_state.voice_note_uploads = voice_note_uploads
     st.session_state.last_message_id = max(st.session_state.last_message_id, message_id)
+    st.session_state.user_transcript_total = max(
+        int(st.session_state.get("user_transcript_total") or 0) + 1,
+        len([item for item in st.session_state.messages if item.get("message_id")]),
+    )
     st.session_state.user_reply_to = None
     st.session_state.carried_history = []
     st.session_state.transition_label = None
@@ -4579,32 +5569,91 @@ def send_user_voice_note(
     return True
 
 
-@st.fragment(run_every="500ms")
+def close_user_voice_note_dialog() -> None:
+    """Resume live chat updates after the recorder dialog closes."""
+    st.session_state.voice_recording_active = False
+
+
+@st.dialog(
+    "Voice note",
+    width="small",
+    on_dismiss=close_user_voice_note_dialog,
+)
+def render_user_voice_note_dialog(
+    mode: str,
+    scenario: str | None,
+    persona: str | None,
+    roleplay_intensity: str | None,
+    character_description: str | None,
+    roleplay_difficulty: str | None,
+    reply_to_message_id: int | None,
+) -> None:
+    """Mount the recorder only after the user explicitly opens it."""
+    st.session_state.voice_recording_active = True
+    st.caption(
+        "Record up to three minutes. Stop and play the preview before sending. "
+        "The voice note stays inside your stored conversation."
+    )
+    voice_recording = st.audio_input(
+        "Record voice note",
+        key=f"user_voice_note_{st.session_state.session_id}",
+    )
+    if voice_recording is None:
+        return
+    if st.button(
+        "Send voice note",
+        type="primary",
+        width="stretch",
+        key=f"send_voice_note_{st.session_state.session_id}",
+    ):
+        with st.spinner("Sending voice note…"):
+            sent = send_user_voice_note(
+                voice_recording,
+                mode,
+                scenario,
+                persona,
+                roleplay_intensity,
+                character_description,
+                roleplay_difficulty,
+                reply_to_message_id,
+            )
+        if sent:
+            st.session_state.voice_recording_active = False
+            st.rerun()
+
+
+@st.fragment(run_every="1s")
 def watch_live_session() -> None:
     user = st.session_state.user
     if not user or not st.session_state.auth_token or not user.get("store_chats"):
         return
+    known_count = max(
+        int(st.session_state.get("user_transcript_total") or 0),
+        len(
+            [
+                item
+                for item in st.session_state.messages
+                if item.get("message_id")
+            ]
+        ),
+    )
     try:
         sync_response = request_api(
             "GET",
-            f"/sessions/{st.session_state.session_id}/sync?after_id={st.session_state.last_message_id}",
+            f"/sessions/{st.session_state.session_id}/sync?after_id={st.session_state.last_message_id}&known_count={known_count}",
             auth=True,
             timeout=5,
         )
         if sync_response.status_code != 200:
             return
         session_status = sync_response.json()
+        server_message_count = int(
+            session_status.get("message_count")
+            if session_status.get("message_count") is not None
+            else known_count
+        )
         if st.session_state.get("voice_recording_active"):
-            server_message_ids = {
-                int(message_id)
-                for message_id in session_status.get("message_ids") or []
-            }
-            local_message_ids = {
-                int(item["message_id"])
-                for item in st.session_state.messages
-                if item.get("message_id")
-            }
-            if server_message_ids != local_message_ids or session_status.get("updates"):
+            if server_message_count != known_count or session_status.get("updates"):
                 st.session_state.voice_recording_pending_refresh = True
             return
         removed = False
@@ -4654,6 +5703,7 @@ def watch_live_session() -> None:
             )
             known_message_ids.add(int(item["id"]))
             added = True
+        st.session_state.user_transcript_total = server_message_count
         if added or removed:
             st.session_state.voice_recording_pending_refresh = False
             st.rerun(scope="app")
@@ -4665,67 +5715,243 @@ def watch_live_session() -> None:
 
 
 @st.fragment
-def publish_user_typing_state(session_id: str) -> None:
+def mount_user_chat_transport(session_id: str) -> None:
+    """Post typing and read state without a custom component."""
     assistant_message_ids = [
         int(item["message_id"])
         for item in st.session_state.messages
         if item.get("role") == "assistant" and item.get("message_id")
     ]
-    confirmed_by_session = dict(st.session_state.confirmed_read_receipts)
-    confirmed_read_ids = [
-        int(message_id)
-        for message_id in confirmed_by_session.get(session_id, [])
-        if str(message_id).isdigit()
-    ]
-    event = typing_capture_component(
-        session_id=session_id,
-        assistant_message_ids=assistant_message_ids,
-        confirmed_read_ids=confirmed_read_ids,
-        default=None,
-        key=f"typing_capture_{session_id}",
-        tab_index=-1,
-    )
-    if not isinstance(event, dict) or not event.get("event_id"):
-        return
-    event_id = str(event["event_id"])
-    previous_ids = st.session_state.typing_capture_event_ids
-    if previous_ids.get(session_id) == event_id:
-        return
-    previous_ids[session_id] = event_id
-    try:
-        read_message_ids = [
-            int(message_id)
-            for message_id in event.get("message_ids") or []
-            if str(message_id).isdigit()
-            and int(message_id) in assistant_message_ids
-            and int(message_id) not in confirmed_read_ids
-        ]
-        if read_message_ids:
-            receipt_response = request_api(
-                "POST",
-                f"/sessions/{session_id}/read",
-                {"message_ids": read_message_ids},
-                auth=True,
-                timeout=5,
-            )
-            if receipt_response.status_code == 200:
-                confirmed_read_ids = sorted(
-                    set(confirmed_read_ids).union(read_message_ids)
-                )
-                confirmed_by_session[session_id] = confirmed_read_ids
-                st.session_state.confirmed_read_receipts = confirmed_by_session
-        if event.get("event_type") == "recording":
-            st.session_state.voice_recording_active = bool(event.get("is_recording"))
-        elif event.get("event_type") == "typing":
-            request_api(
-                "POST",
-                f"/sessions/{session_id}/typing",
-                {"is_typing": bool(event.get("is_typing"))},
-                auth=True,
-                timeout=5,
-            )
-    except requests.RequestException:
-        return
+    transport_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    with st.container(key=f"user_chat_transport_{transport_hash}"):
+        st.html(
+            f"""<span class="dilse-browser-script-marker" hidden></span><script>
+            (() => {{
+                const parentWindow = window.parent;
+                const parentDocument = parentWindow.document;
+                const sessionId = {json.dumps(session_id)};
+                const userToken = {json.dumps(str(st.session_state.auth_token or ""))};
+                const assistantMessageIds = {json.dumps(assistant_message_ids)};
+                const previous = parentWindow.__dilseChatTransport;
+                const confirmedReadIds = previous?.sessionId === sessionId
+                    ? previous.confirmedReadIds
+                    : new Set();
+                if (typeof previous?.cleanup === "function") previous.cleanup();
+
+                const state = {{
+                    sessionId,
+                    confirmedReadIds,
+                    pendingReadIds: new Set(),
+                    intersectingReadIds: new Set(),
+                    observedReadElements: new WeakSet(),
+                    typing: false,
+                    lastHeartbeat: 0,
+                    suppressEventsUntil: 0,
+                    typingRequestInFlight: false,
+                    queuedTypingState: null,
+                    readRequestInFlight: false,
+                    activeInput: null,
+                    activeInputContainer: null,
+                    observer: null,
+                    readObserver: null,
+                    heartbeatTimer: null,
+                    cleanup: null
+                }};
+                parentWindow.__dilseChatTransport = state;
+
+                const postSessionEvent = (eventName, payload) => {{
+                    if (!sessionId || !userToken) return Promise.resolve(null);
+                    return parentWindow.fetch(
+                        `/api/sessions/${{encodeURIComponent(sessionId)}}/${{eventName}}`,
+                        {{
+                            method: "POST",
+                            headers: {{
+                                "Content-Type": "application/json",
+                                "X-User-Token": userToken
+                            }},
+                            credentials: "same-origin",
+                            cache: "no-store",
+                            body: JSON.stringify(payload)
+                        }}
+                    );
+                }};
+
+                const flushTyping = async () => {{
+                    if (state.typingRequestInFlight || state.queuedTypingState === null) return;
+                    const nextState = state.queuedTypingState;
+                    state.queuedTypingState = null;
+                    state.typingRequestInFlight = true;
+                    try {{
+                        await postSessionEvent("typing", {{ is_typing: nextState }});
+                    }} catch (_) {{
+                    }} finally {{
+                        state.typingRequestInFlight = false;
+                        if (state.queuedTypingState !== null) void flushTyping();
+                    }}
+                }};
+                const sendTyping = (isTyping, force = false) => {{
+                    const now = Date.now();
+                    if (!force && isTyping === state.typing && now - state.lastHeartbeat < 1100) return;
+                    state.typing = isTyping;
+                    state.lastHeartbeat = now;
+                    state.queuedTypingState = Boolean(isTyping);
+                    void flushTyping();
+                }};
+
+                const flushReadReceipts = async () => {{
+                    if (state.readRequestInFlight || !state.pendingReadIds.size) return;
+                    const messageIds = Array.from(state.pendingReadIds).slice(0, 100);
+                    state.readRequestInFlight = true;
+                    let delivered = false;
+                    try {{
+                        const response = await postSessionEvent(
+                            "read",
+                            {{ message_ids: messageIds }}
+                        );
+                        delivered = Boolean(response?.ok);
+                        if (delivered) {{
+                            messageIds.forEach((messageId) => {{
+                                state.confirmedReadIds.add(messageId);
+                                state.pendingReadIds.delete(messageId);
+                            }});
+                        }}
+                    }} catch (_) {{
+                    }} finally {{
+                        state.readRequestInFlight = false;
+                        if (delivered && state.pendingReadIds.size) void flushReadReceipts();
+                    }}
+                }};
+                const sendReadReceipts = () => {{
+                    if (
+                        parentDocument.hidden ||
+                        !parentDocument.hasFocus() ||
+                        Date.now() < state.suppressEventsUntil
+                    ) return;
+                    state.intersectingReadIds.forEach((messageId) => {{
+                        if (
+                            assistantMessageIds.includes(messageId) &&
+                            !state.confirmedReadIds.has(messageId)
+                        ) state.pendingReadIds.add(messageId);
+                    }});
+                    state.confirmedReadIds.forEach((messageId) =>
+                        state.pendingReadIds.delete(messageId)
+                    );
+                    if (state.pendingReadIds.size) void flushReadReceipts();
+                }};
+                const refreshReadTargets = () => {{
+                    if (!state.readObserver) {{
+                        state.readObserver = new parentWindow.IntersectionObserver((entries) => {{
+                            entries.forEach((entry) => {{
+                                const marker = entry.target.querySelector(
+                                    "[data-dilse-read-message-id]"
+                                );
+                                const messageId = marker && Number(
+                                    marker.dataset.dilseReadMessageId
+                                );
+                                if (!Number.isInteger(messageId)) return;
+                                if (entry.isIntersecting && entry.intersectionRatio > 0) {{
+                                    state.intersectingReadIds.add(messageId);
+                                }} else {{
+                                    state.intersectingReadIds.delete(messageId);
+                                }}
+                            }});
+                            sendReadReceipts();
+                        }}, {{ threshold: 0.01 }});
+                    }}
+                    parentDocument
+                        .querySelectorAll("[data-dilse-read-message-id]")
+                        .forEach((marker) => {{
+                            const message = marker.closest(
+                                '[data-testid="stChatMessage"]'
+                            ) || marker;
+                            if (state.observedReadElements.has(message)) return;
+                            state.observedReadElements.add(message);
+                            state.readObserver.observe(message);
+                        }});
+                }};
+
+                const onInput = () => {{
+                    if (Date.now() < state.suppressEventsUntil) return;
+                    const hasDraft = Boolean(state.activeInput?.value.trim());
+                    sendTyping(hasDraft, hasDraft !== state.typing);
+                }};
+                const onKeyDown = (event) => {{
+                    if (event.key === "Enter" && !event.shiftKey) {{
+                        state.suppressEventsUntil = Date.now() + 2500;
+                        sendTyping(false, true);
+                    }}
+                }};
+                const onComposerPointerDown = (event) => {{
+                    if (event.target?.closest("button")) {{
+                        state.suppressEventsUntil = Date.now() + 2500;
+                        sendTyping(false, true);
+                    }}
+                }};
+                const detachInput = () => {{
+                    if (!state.activeInput) return;
+                    state.activeInput.removeEventListener("input", onInput);
+                    state.activeInput.removeEventListener("keydown", onKeyDown);
+                    state.activeInputContainer?.removeEventListener(
+                        "pointerdown",
+                        onComposerPointerDown
+                    );
+                    state.activeInput = null;
+                    state.activeInputContainer = null;
+                }};
+                const attachInput = () => {{
+                    const nextInput = parentDocument.querySelector(
+                        '[data-testid="stChatInput"] textarea'
+                    );
+                    if (!nextInput || nextInput === state.activeInput) return;
+                    detachInput();
+                    state.activeInput = nextInput;
+                    state.activeInputContainer = nextInput.closest(
+                        '[data-testid="stChatInput"]'
+                    );
+                    state.activeInput.addEventListener("input", onInput);
+                    state.activeInput.addEventListener("keydown", onKeyDown);
+                    state.activeInputContainer?.addEventListener(
+                        "pointerdown",
+                        onComposerPointerDown
+                    );
+                    onInput();
+                }};
+
+                const onVisibilityChange = () => sendReadReceipts();
+                const onFocus = () => sendReadReceipts();
+                parentDocument.addEventListener("visibilitychange", onVisibilityChange);
+                parentWindow.addEventListener("focus", onFocus);
+                attachInput();
+                refreshReadTargets();
+                sendReadReceipts();
+                state.observer = new parentWindow.MutationObserver(() => {{
+                    attachInput();
+                    refreshReadTargets();
+                }});
+                state.observer.observe(parentDocument.body, {{ childList: true, subtree: true }});
+                state.heartbeatTimer = parentWindow.setInterval(() => {{
+                    attachInput();
+                    refreshReadTargets();
+                    if (Date.now() >= state.suppressEventsUntil) {{
+                        if (state.activeInput?.value.trim()) sendTyping(true, true);
+                        sendReadReceipts();
+                    }}
+                }}, 1500);
+                state.cleanup = () => {{
+                    state.observer?.disconnect();
+                    state.readObserver?.disconnect();
+                    if (state.heartbeatTimer) parentWindow.clearInterval(state.heartbeatTimer);
+                    parentDocument.removeEventListener(
+                        "visibilitychange",
+                        onVisibilityChange
+                    );
+                    parentWindow.removeEventListener("focus", onFocus);
+                    detachInput();
+                }};
+            }})();
+            </script>""",
+            unsafe_allow_javascript=True,
+        )
 
 
 def follow_latest_chat_message(
@@ -4758,17 +5984,30 @@ def follow_latest_chat_message(
         ),
         unsafe_allow_html=True,
     )
-    components.html(
-        f"""<script>
+    st.html(
+        f"""<span class="dilse-browser-script-marker" hidden></span><script>
         (() => {{
             const parentWindow = window.parent;
             const parentDocument = parentWindow.document;
             const scrollKey = {json.dumps(scroll_key)};
             const signature = {json.dumps(signature)};
+            const messageKeys = {json.dumps(signature_parts)};
             const anchorId = {json.dumps(anchor_id)};
             const followState = parentWindow.__dilseChatFollowState ||
                 (parentWindow.__dilseChatFollowState = {{}});
-            if (followState[scrollKey] === signature) return;
+            const previous = followState[scrollKey];
+            if (previous?.signature === signature) return;
+            const historyWasPrepended = Boolean(
+                previous?.messageKeys?.length &&
+                messageKeys.length > previous.messageKeys.length &&
+                messageKeys.slice(-previous.messageKeys.length).every(
+                    (value, index) => value === previous.messageKeys[index]
+                )
+            );
+            if (historyWasPrepended) {{
+                followState[scrollKey] = {{signature, messageKeys}};
+                return;
+            }}
             const findScrollContainer = (element) => {{
                 const transcriptRoot = element?.closest(
                     '.st-key-user_chat_transcript, [class*="st-key-admin_chat_transcript_"]'
@@ -4793,7 +6032,7 @@ def follow_latest_chat_message(
                     left: scrollContainer.scrollLeft,
                     behavior: "auto"
                 }});
-                if (complete) followState[scrollKey] = signature;
+                if (complete) followState[scrollKey] = {{signature, messageKeys}};
                 return true;
             }};
             parentWindow.requestAnimationFrame(() =>
@@ -4804,9 +6043,190 @@ def follow_latest_chat_message(
             parentWindow.setTimeout(() => moveToLatest(true), 700);
         }})();
         </script>""",
-        height=0,
-        width=0,
+        unsafe_allow_javascript=True,
     )
+
+
+def scroll_mobile_chat_to_composer(conversation_id: str, request_id: int) -> None:
+    """Place the newest message and composer in view after opening a mobile chat."""
+    scroll_key = f"{conversation_id}:{request_id}"
+    st.html(
+        f"""<span class="dilse-browser-script-marker" hidden></span><script>
+        (() => {{
+            const parentWindow = window.parent;
+            const parentDocument = parentWindow.document;
+            const scrollKey = {json.dumps(scroll_key)};
+            const scrollState = parentWindow.__dilseComposerScrollState ||
+                (parentWindow.__dilseComposerScrollState = {{}});
+            if (scrollState[scrollKey]) return;
+            const moveToComposer = (complete = false) => {{
+                const composer = parentDocument.querySelector(
+                    '.st-key-user_compact_composer'
+                );
+                if (!composer || !composer.isConnected) return false;
+                composer.scrollIntoView({{
+                    block: 'end',
+                    inline: 'nearest',
+                    behavior: 'auto'
+                }});
+                if (complete) scrollState[scrollKey] = true;
+                return true;
+            }};
+            parentWindow.requestAnimationFrame(() =>
+                parentWindow.requestAnimationFrame(() => moveToComposer(false))
+            );
+            parentWindow.setTimeout(() => moveToComposer(false), 120);
+            parentWindow.setTimeout(() => moveToComposer(false), 350);
+            parentWindow.setTimeout(() => moveToComposer(true), 700);
+        }})();
+        </script>""",
+        unsafe_allow_javascript=True,
+    )
+
+
+def transcript_history_event(
+    view: str,
+    conversation_id: str,
+    transcript_key: str,
+    messages: list[dict[str, Any]],
+    total_message_count: int,
+) -> int | None:
+    """Request the next history page when the reader intentionally reaches the top."""
+    stored_ids = sorted(
+        int(item.get("message_id") or item.get("id"))
+        for item in messages
+        if item.get("message_id") or item.get("id")
+    )
+    if not stored_ids:
+        return None
+    oldest_id = stored_ids[0]
+    can_load_older = total_message_count > len(stored_ids)
+    if not can_load_older:
+        return None
+    scroll_key = f"{view}:{conversation_id}"
+    trigger_hash = hashlib.sha256(scroll_key.encode("utf-8")).hexdigest()[:16]
+    trigger_key = f"transcript_history_{trigger_hash}"
+    with st.container(key=f"{trigger_key}_shell"):
+        load_requested = st.button(
+            "Load older messages",
+            key=trigger_key,
+            help="Older messages load automatically when you scroll to the top.",
+        )
+        st.html(
+            f"""<span class="dilse-browser-script-marker" hidden></span><script>
+            (() => {{
+                const parentWindow = window.parent;
+                const parentDocument = parentWindow.document;
+                const scrollKey = {json.dumps(scroll_key)};
+                const transcriptKey = {json.dumps(transcript_key)};
+                const triggerKey = {json.dumps(trigger_key)};
+                const oldestId = {oldest_id};
+                const allState = parentWindow.__dilseTranscriptPagingState ||
+                    (parentWindow.__dilseTranscriptPagingState = {{}});
+                const state = allState[scrollKey] ||
+                    (allState[scrollKey] = {{
+                        reportedCursor: null,
+                        snapshot: null,
+                        userIntent: false,
+                        detach: null
+                    }});
+                if (typeof state.detach === "function") state.detach();
+
+                const transcriptRoot = () => {{
+                    try {{
+                        return parentDocument.querySelector(
+                            `.${{CSS.escape(`st-key-${{transcriptKey}}`)}}`
+                        );
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+                const scrollContainer = () => {{
+                    const root = transcriptRoot();
+                    if (!root) return null;
+                    const candidates = [root, ...root.querySelectorAll("*")];
+                    return candidates.find((candidate) => {{
+                        const style = parentWindow.getComputedStyle(candidate);
+                        return /auto|scroll/.test(style.overflowY) &&
+                            candidate.scrollHeight > candidate.clientHeight + 1;
+                    }}) || null;
+                }};
+                const triggerButton = () => {{
+                    try {{
+                        return parentDocument.querySelector(
+                            `.${{CSS.escape(`st-key-${{triggerKey}}`)}} button`
+                        );
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+                const restoreAfterPrepend = () => {{
+                    const snapshot = state.snapshot;
+                    if (!snapshot || String(snapshot.oldestId) === String(oldestId)) return;
+                    const restore = () => {{
+                        const current = scrollContainer();
+                        if (!current) return;
+                        const addedHeight = Math.max(
+                            0,
+                            current.scrollHeight - snapshot.scrollHeight
+                        );
+                        current.scrollTop = snapshot.scrollTop + addedHeight;
+                        state.snapshot = null;
+                        state.userIntent = false;
+                    }};
+                    parentWindow.requestAnimationFrame(() =>
+                        parentWindow.requestAnimationFrame(restore)
+                    );
+                    parentWindow.setTimeout(restore, 120);
+                    parentWindow.setTimeout(restore, 350);
+                }};
+                const install = () => {{
+                    const container = scrollContainer();
+                    if (!container) {{
+                        parentWindow.setTimeout(install, 120);
+                        return;
+                    }}
+                    restoreAfterPrepend();
+                    const markIntent = () => {{ state.userIntent = true; }};
+                    const onKeyDown = (event) => {{
+                        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {{
+                            markIntent();
+                        }}
+                    }};
+                    const onScroll = () => {{
+                        if (!state.userIntent || container.scrollTop > 72) return;
+                        const cursor = String(oldestId);
+                        if (!oldestId || state.reportedCursor === cursor) return;
+                        const button = triggerButton();
+                        if (!button) return;
+                        state.reportedCursor = cursor;
+                        state.snapshot = {{
+                            oldestId,
+                            scrollHeight: container.scrollHeight,
+                            scrollTop: container.scrollTop
+                        }};
+                        state.userIntent = false;
+                        button.click();
+                    }};
+                    container.addEventListener("wheel", markIntent, {{ passive: true }});
+                    container.addEventListener("touchstart", markIntent, {{ passive: true }});
+                    container.addEventListener("pointerdown", markIntent, {{ passive: true }});
+                    container.addEventListener("keydown", onKeyDown);
+                    container.addEventListener("scroll", onScroll, {{ passive: true }});
+                    state.detach = () => {{
+                        container.removeEventListener("wheel", markIntent);
+                        container.removeEventListener("touchstart", markIntent);
+                        container.removeEventListener("pointerdown", markIntent);
+                        container.removeEventListener("keydown", onKeyDown);
+                        container.removeEventListener("scroll", onScroll);
+                    }};
+                }};
+                install();
+            }})();
+            </script>""",
+            unsafe_allow_javascript=True,
+        )
+    return oldest_id if load_requested else None
 
 
 def show_admin_chat_unread_badge(
@@ -4819,8 +6239,8 @@ def show_admin_chat_unread_badge(
         for message in messages
         if message.get("role") == "user" and message.get("id") is not None
     ]
-    components.html(
-        f"""<script>
+    st.html(
+        f"""<span class="dilse-browser-script-marker" hidden></span><script>
         (() => {{
             const parentWindow = window.parent;
             const parentDocument = parentWindow.document;
@@ -4897,8 +6317,7 @@ def show_admin_chat_unread_badge(
             window.setTimeout(renderBadge, 180);
         }})();
         </script>""",
-        height=0,
-        width=0,
+        unsafe_allow_javascript=True,
     )
 
 
@@ -4962,6 +6381,89 @@ def character_profile_guidance(persona_slug: str, persona_name: str) -> dict[str
         "relationship": relationship,
         "question": "How do they normally speak, react to discomfort, show care, and handle disagreement?",
         "placeholder": "Describe their temperament, speaking style, common reactions, and any relationship history DilSe should preserve during the roleplay.",
+    }
+
+
+def current_conversation_settings(
+    catalog: dict[str, list[dict[str, Any]]],
+    experience_v2: bool,
+) -> dict[str, str | None]:
+    """Read chat settings without building the hidden desktop settings panel on phones."""
+    mode = "listener" if st.session_state.mode == "The Listener" else "partner"
+    if mode == "listener":
+        return {
+            "mode": mode,
+            "scenario_slug": None,
+            "persona_slug": None,
+            "scenario_name": None,
+            "persona_name": None,
+            "roleplay_intensity": None,
+            "roleplay_difficulty": None,
+            "character_description": None,
+        }
+
+    personas = list(catalog.get("personas") or [])
+    scenarios = list(catalog.get("scenarios") or [])
+    persona_slug = str(
+        (
+            st.session_state.get("v2_partner_persona_slug")
+            if experience_v2
+            else None
+        )
+        or st.session_state.get("resumed_persona_slug")
+        or ""
+    ) or None
+    selected_persona = next(
+        (item for item in personas if str(item.get("slug")) == persona_slug),
+        None,
+    )
+    if not experience_v2 and selected_persona is None and personas:
+        selected_name = str(st.session_state.get("roleplay_persona_name") or "")
+        selected_persona = next(
+            (item for item in personas if str(item.get("name")) == selected_name),
+            personas[0],
+        )
+        persona_slug = str(selected_persona.get("slug") or "") or None
+    persona_name = (
+        str(selected_persona.get("name"))
+        if selected_persona
+        else str(st.session_state.get("v2_partner_persona_name") or "") or None
+    )
+
+    scenario_slug = str(
+        st.session_state.get("resumed_scenario_slug")
+        or st.session_state.get("v2_scenario_slug")
+        or ""
+    ) or None
+    selected_scenario = next(
+        (item for item in scenarios if str(item.get("slug")) == scenario_slug),
+        None,
+    )
+    if selected_scenario is None and scenarios:
+        selected_name = str(st.session_state.get("roleplay_scenario_name") or "")
+        selected_scenario = next(
+            (item for item in scenarios if str(item.get("name")) == selected_name),
+            scenarios[0],
+        )
+        scenario_slug = str(selected_scenario.get("slug") or "") or None
+
+    return {
+        "mode": mode,
+        "scenario_slug": scenario_slug,
+        "persona_slug": persona_slug,
+        "scenario_name": (
+            str(selected_scenario.get("name")) if selected_scenario else None
+        ),
+        "persona_name": persona_name,
+        "roleplay_intensity": str(
+            st.session_state.get("roleplay_intensity") or "Explicit"
+        ).lower(),
+        "roleplay_difficulty": str(
+            st.session_state.get("roleplay_difficulty") or "Realistic"
+        ).lower(),
+        "character_description": (
+            str(st.session_state.get("character_description") or "").strip() or None
+        ),
     }
 
 
@@ -5575,6 +7077,7 @@ def render_talk(
     setup_container: Any | None = None,
 ) -> None:
     experience_v2 = uses_conversation_experience_v2()
+    mobile_browser = is_mobile_browser()
     if experience_v2:
         st.markdown('<span class="dilse-v2-marker"></span>', unsafe_allow_html=True)
     if not st.session_state.messages and not st.session_state.conversation_mode_confirmed:
@@ -5600,7 +7103,9 @@ def render_talk(
     setup_renderer = (
         render_conversation_setup_v2 if experience_v2 else render_conversation_setup
     )
-    if setup_container is None:
+    if mobile_browser and not st.session_state.mobile_conversation_settings_open:
+        settings = current_conversation_settings(catalog, experience_v2)
+    elif setup_container is None:
         settings = setup_renderer(catalog)
     else:
         with setup_container:
@@ -5714,6 +7219,19 @@ def render_talk(
     watch_live_session()
 
     if st.session_state.messages:
+        set_message_media_scope(f"user:{st.session_state.session_id}")
+        stored_message_count = len(
+            [
+                item
+                for item in st.session_state.messages
+                if item.get("message_id")
+            ]
+        )
+        total_message_count = max(
+            int(st.session_state.get("user_transcript_total") or 0),
+            stored_message_count,
+        )
+        loaded_session = st.session_state.get("loaded_session_metadata")
         with st.container(
             height=520,
             border=False,
@@ -5756,6 +7274,16 @@ def render_talk(
                 str(st.session_state.session_id),
                 st.session_state.messages,
             )
+        if loaded_session:
+            before_id = transcript_history_event(
+                "user",
+                str(st.session_state.session_id),
+                "user_chat_transcript",
+                st.session_state.messages,
+                total_message_count,
+            )
+            if before_id is not None and load_earlier_user_messages(before_id):
+                st.rerun(scope="app")
 
     latest_assistant = next(
         (item for item in reversed(st.session_state.messages) if item.get("role") == "assistant" and not item.get("error")),
@@ -5908,51 +7436,34 @@ def render_talk(
     elif selected_reply:
         st.session_state.user_reply_to = None
 
-    if not partner_profile_required:
+    def render_voice_note_control() -> None:
         with st.container(key="user_voice_note_composer"):
-            with st.popover(
-                "Voice note",
+            if st.button(
+                "Record voice note" if mobile_browser else "Voice note",
                 icon=":material/mic:",
                 help="Record a private voice note for this conversation",
+                key=f"open_user_voice_note_{st.session_state.session_id}",
             ):
-                st.caption(
-                    "Record up to three minutes. Stop and play the preview before sending. "
-                    "The voice note stays inside your stored conversation."
+                voice_reply_to_message_id = (
+                    int(selected_reply["message_id"])
+                    if selected_reply.get("session_id") == st.session_state.session_id
+                    and selected_reply_exists
+                    and selected_reply.get("message_id")
+                    else None
                 )
-                voice_recording = st.audio_input(
-                    "Record voice note",
-                    key=f"user_voice_note_{st.session_state.session_id}",
+                render_user_voice_note_dialog(
+                    mode,
+                    scenario_slug,
+                    persona_slug,
+                    roleplay_intensity,
+                    character_description,
+                    roleplay_difficulty,
+                    voice_reply_to_message_id,
                 )
-                if voice_recording is not None:
-                    voice_reply_to_message_id = (
-                        int(selected_reply["message_id"])
-                        if selected_reply.get("session_id") == st.session_state.session_id
-                        and selected_reply_exists
-                        and selected_reply.get("message_id")
-                        else None
-                    )
-                    if st.button(
-                        "Send voice note",
-                        type="primary",
-                        use_container_width=True,
-                        key=f"send_voice_note_{st.session_state.session_id}",
-                    ):
-                        with st.spinner("Sending voice note…"):
-                            sent = send_user_voice_note(
-                                voice_recording,
-                                mode,
-                                scenario_slug,
-                                persona_slug,
-                                roleplay_intensity,
-                                character_description,
-                                roleplay_difficulty,
-                                voice_reply_to_message_id,
-                            )
-                        if sent:
-                            st.rerun()
 
+    prompt: str | None = None
     if partner_persona_required:
-        prompt = None
+        pass
     elif partner_profile_required:
         profile_copy = character_profile_guidance(
             str(persona_slug or ""), str(persona_name or "this person")
@@ -5969,13 +7480,25 @@ def render_talk(
             if mode == "partner"
             else "Message DilSe…"
         )
-        prompt = st.chat_input(prompt_placeholder, key="conversation_chat_input")
-    # Do not mount the typing/read-receipt component beside Streamlit's chat
-    # input. Component callbacks can trigger a fragment rerun while the chat
-    # form is submitting, which discards the user's message before send_chat()
-    # receives it. Reliable message delivery takes precedence over these
-    # presence indicators until they are moved to a transport that does not
-    # rerun the Streamlit app.
+        with st.container(key="user_compact_composer"):
+            render_voice_note_control()
+            prompt = st.chat_input(
+                prompt_placeholder,
+                key="conversation_chat_input",
+            )
+
+    if st.session_state.get("scroll_chat_composer"):
+        scroll_mobile_chat_to_composer(
+            str(st.session_state.session_id),
+            int(st.session_state.scroll_request_id),
+        )
+        st.session_state.scroll_chat_composer = False
+
+    # Read and typing events are sent from the browser component straight to
+    # the same-origin API. Only voice-recording state uses a Streamlit component
+    # value, so presence updates cannot rerun the chat while a message submits.
+    if not partner_persona_required and not partner_profile_required:
+        mount_user_chat_transport(str(st.session_state.session_id))
     if prompt and partner_profile_required:
         captured_profile = str(prompt).strip()
         if len(captured_profile) < CHARACTER_PROFILE_MIN_LENGTH:
@@ -6243,28 +7766,36 @@ def render_conversations() -> None:
         mode_label = "The Partner" if session.get("mode") == "partner" else "The Listener"
         activity = format_session_activity(session.get("last_activity"))
         message_count = int(session.get("message_count") or 0)
+        unread_count = int(session.get("unread_count") or 0)
         session_id = str(session["session_id"])
         with st.container(border=True):
             st.markdown('<span class="conversation-row-marker"></span>', unsafe_allow_html=True)
             copy_col, action_col = st.columns([4.2, 1.25], vertical_alignment="center")
             with copy_col:
+                unread_markup = (
+                    f'<span class="conversation-unread">{unread_count} new</span>'
+                    if unread_count
+                    else ""
+                )
                 st.markdown(
-                    f'<div class="conversation-row-copy"><h3>{html.escape(opening)}</h3><p><span class="conversation-mode-chip">{html.escape(mode_label)}</span>{html.escape(activity)} · {message_count} {"message" if message_count == 1 else "messages"}</p></div>',
+                    f'<div class="conversation-row-copy"><h3>{html.escape(opening)}</h3><p>'
+                    f'{unread_markup}<span class="conversation-mode-chip">{html.escape(mode_label)}</span>'
+                    f'{html.escape(activity)} · {message_count} {"message" if message_count == 1 else "messages"}</p></div>',
                     unsafe_allow_html=True,
                 )
             with action_col:
                 if st.button(
-                    "Open chat",
+                    "Open new message" if unread_count else "Open chat",
                     key=f"resume_session_{session_id}",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     load_saved_conversation(session)
                     st.rerun()
                 if st.button(
                     "Remove",
                     key=f"delete_saved_{session_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state.pending_delete_session_id = session_id
                     st.rerun()
@@ -6571,15 +8102,20 @@ def render_account() -> None:
     st.button(
         "Sign out of DilSe",
         on_click=sign_out,
-        use_container_width=True,
+        width="stretch",
         key="account_page_signout",
     )
 
     st.markdown(
-        '<div class="danger-zone"><h2>Delete account</h2><p>This permanently removes your account, stored messages, consent records, and feedback. This action cannot be reversed.</p></div>',
+        '<div class="danger-zone"><h2>Delete account</h2><p>This removes your account and stored data from the live DilSe service. Older protected backups, when present, are outside the live service and follow the backup process. This action cannot be reversed.</p></div>',
         unsafe_allow_html=True,
     )
     with st.expander("I want to delete my account"):
+        delete_reason_label = st.selectbox(
+            "Why are you leaving? (optional)",
+            list(ACCOUNT_DELETION_REASONS),
+            key="account_deletion_reason",
+        )
         delete_password = st.text_input(
             "Enter your password",
             type="password",
@@ -6592,25 +8128,35 @@ def render_account() -> None:
         delete_account = st.button(
             "Delete my account permanently",
             disabled=delete_phrase.strip() != "DELETE" or not delete_password,
-            use_container_width=True,
+            width="stretch",
             key="delete_account_button",
         )
     if delete_account:
-        response = request_api("DELETE", "/account", {"password": delete_password}, auth=True)
-        if response.status_code == 204:
-            forget_browser_login()
-            st.session_state.auth_token = None
-            st.session_state.user = None
-            reset_local_conversation()
-            st.rerun()
-        else:
-            st.error(error_detail(response))
+        try:
+            response = request_api(
+                "DELETE",
+                "/account",
+                {
+                    "password": delete_password,
+                    "departure_reason": ACCOUNT_DELETION_REASONS[delete_reason_label],
+                },
+                auth=True,
+                timeout=20,
+            )
+            if response.status_code == 200:
+                complete_account_deletion(response)
+                st.rerun()
+            else:
+                st.error(error_detail(response))
+        except requests.RequestException:
+            st.error("DilSe could not delete the account. Check your connection and try again.")
 
 
 def set_main_page(page: str) -> None:
     st.session_state.page = page
     st.session_state.main_navigation = page
     st.session_state.mobile_conversation_settings_open = False
+    st.session_state.scroll_chat_composer = False
     st.session_state.scroll_dashboard_top = True
     st.session_state.scroll_request_id += 1
 
@@ -6649,12 +8195,20 @@ def render_left_rail() -> None:
             opening = " ".join(str(session.get("first_user_message") or "Conversation").split())
             if len(opening) > 44:
                 opening = f"{opening[:41].rstrip()}…"
+            unread_count = int(session.get("unread_count") or 0)
+            button_label = (
+                f"● {opening} ({unread_count})" if unread_count else opening
+            )
             st.button(
-                opening,
+                button_label,
                 on_click=load_saved_conversation,
                 args=(session,),
-                use_container_width=True,
-                key=f"rail_session_{session['session_id']}",
+                width="stretch",
+                key=(
+                    f"rail_unread_session_{session['session_id']}"
+                    if unread_count
+                    else f"rail_session_{session['session_id']}"
+                ),
             )
     else:
         st.caption("Your conversations will appear here.")
@@ -6801,8 +8355,8 @@ def render_mobile_navigation() -> None:
 
 def render_signed_in_shell(catalog: dict[str, list[dict[str, Any]]]) -> None:
     if st.session_state.scroll_dashboard_top:
-        components.html(
-            """<script>
+        st.html(
+            """<span class="dilse-browser-script-marker" hidden></span><script>
             const scrollRequest = __SCROLL_REQUEST__;
             const resetDashboardScroll = () => {
                 const parentDocument = window.parent.document;
@@ -6822,8 +8376,7 @@ def render_signed_in_shell(catalog: dict[str, list[dict[str, Any]]]) -> None:
             </script>""".replace(
                 "__SCROLL_REQUEST__", str(int(st.session_state.scroll_request_id))
             ),
-            height=0,
-            width=0,
+            unsafe_allow_javascript=True,
         )
         st.session_state.scroll_dashboard_top = False
     left, centre, right = st.columns([1.05, 3.25, 1.4], gap="medium")
@@ -6831,6 +8384,7 @@ def render_signed_in_shell(catalog: dict[str, list[dict[str, Any]]]) -> None:
         render_left_rail()
 
     with centre:
+        render_user_unread_bubble()
         render_mobile_navigation()
         if st.session_state.page == "Talk":
             render_talk(catalog, right)
@@ -7567,12 +9121,13 @@ def render_admin_workspace() -> None:
     with audit_tab:
         audit_rows = admin_json("GET", "/admin/audit") or []
         st.caption("Every conversation view, prompt change, control change, note, and human reply is recorded here.")
-        st.dataframe(audit_rows, use_container_width=True, hide_index=True)
+        st.dataframe(audit_rows, width="stretch", hide_index=True)
 
 
 ADMIN_PAGES = (
     "Overview",
     "Visitors",
+    "IP blocking",
     "App usage",
     "Users",
     "Conversations",
@@ -7597,6 +9152,11 @@ def restore_admin_navigation() -> None:
     requested_session = str(st.query_params.get("admin_session") or "")
     if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", requested_session):
         st.session_state.admin_selected_session_id = requested_session
+    st.session_state.admin_navigation_target = {
+        "page": st.session_state.admin_page,
+        "user_id": st.session_state.get("admin_selected_user_id"),
+        "session_id": st.session_state.get("admin_selected_session_id"),
+    }
     st.session_state.admin_navigation_restored = True
 
 
@@ -7616,10 +9176,204 @@ def persist_admin_navigation() -> None:
         del st.query_params["admin_session"]
 
 
-def admin_go_to(page: str) -> None:
+def stage_admin_navigation(
+    page: str,
+    *,
+    user_id: int | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Stage logical and widget navigation state for the next full app run."""
     st.session_state.admin_page = page
+    if user_id is not None:
+        st.session_state.admin_selected_user_id = int(user_id)
+    if session_id is not None:
+        st.session_state.admin_selected_session_id = str(session_id)
+    target: dict[str, Any] = {"page": page}
+    if page == "Conversations":
+        target["user_id"] = st.session_state.get("admin_selected_user_id")
+        target["session_id"] = st.session_state.get("admin_selected_session_id")
+    st.session_state.admin_navigation_target = target
+
+
+def synchronise_admin_page_picker() -> None:
+    """Apply staged page state before the mobile navigation widget is created."""
+    target = st.session_state.get("admin_navigation_target")
+    if not isinstance(target, dict):
+        return
+    page = str(target.get("page") or "")
+    if page not in ADMIN_PAGES:
+        st.session_state.admin_navigation_target = None
+        return
+    st.session_state.admin_page = page
+    st.session_state.admin_mobile_page_picker = page
+    if page != "Conversations":
+        st.session_state.admin_navigation_target = None
+
+
+def admin_go_to(page: str) -> None:
+    stage_admin_navigation(page)
     persist_admin_navigation()
     st.rerun()
+
+
+def admin_mobile_page_changed() -> None:
+    """Keep the logical admin page in step with the compact navigation widget."""
+    page = str(st.session_state.get("admin_mobile_page_picker") or "")
+    if page not in ADMIN_PAGES:
+        return
+    stage_admin_navigation(page)
+    persist_admin_navigation()
+
+
+def open_admin_conversation_from_switcher(user_id: int, session_id: str) -> None:
+    """Open one active or unread conversation directly from the admin switcher."""
+    stage_admin_navigation(
+        "Conversations",
+        user_id=user_id,
+        session_id=session_id,
+    )
+    st.session_state.admin_reply_to = None
+    st.session_state.admin_pending_roman_urdu_review = None
+    st.session_state.admin_pending_voice_preview = None
+    persist_admin_navigation()
+    st.rerun()
+
+
+@st.fragment(run_every="5s")
+def render_admin_inbox_notification() -> None:
+    inbox = admin_json("GET", "/admin/inbox?limit=20", timeout=8) or {}
+    active = admin_json("GET", "/admin/sessions/active?minutes=60", timeout=8) or []
+    total_unread = int(inbox.get("total_unread") or 0)
+    unread_conversations = list(inbox.get("conversations") or [])
+    if not active and not unread_conversations:
+        return
+
+    unread_by_session = {
+        str(conversation.get("session_id") or ""): dict(conversation)
+        for conversation in unread_conversations
+        if conversation.get("session_id")
+    }
+    conversations_by_session: dict[str, dict[str, Any]] = {}
+    for active_session in active:
+        session_id = str(active_session.get("session_id") or "")
+        if not session_id:
+            continue
+        row = dict(active_session)
+        row["is_active"] = True
+        row["unread_count"] = 0
+        if session_id in unread_by_session:
+            unread_row = unread_by_session.pop(session_id)
+            row.update(unread_row)
+            row["conversation_mode"] = (
+                active_session.get("conversation_mode")
+                or unread_row.get("mode")
+                or "listener"
+            )
+            row["control_mode"] = active_session.get("control_mode") or "ai"
+            row["is_active"] = True
+        conversations_by_session[session_id] = row
+    for session_id, unread_row in unread_by_session.items():
+        row = dict(unread_row)
+        row["is_active"] = False
+        conversations_by_session[session_id] = row
+
+    conversations = list(conversations_by_session.values())
+    for conversation in conversations:
+        unread_count = int(conversation.get("unread_count") or 0)
+        conversation["needs_reply"] = bool(
+            unread_count > 0
+            and str(conversation.get("control_mode") or "ai") == "human"
+        )
+    conversations.sort(
+        key=lambda conversation: (
+            2 if conversation.get("needs_reply") else 1 if int(conversation.get("unread_count") or 0) else 0,
+            str(conversation.get("last_activity") or ""),
+        ),
+        reverse=True,
+    )
+    needs_reply_count = sum(
+        1 for conversation in conversations if conversation.get("needs_reply")
+    )
+    active_count = len(active)
+    if needs_reply_count:
+        reply_label = "needs reply" if needs_reply_count == 1 else "need replies"
+        label = f"{needs_reply_count} {reply_label} · {active_count} active"
+    elif total_unread:
+        label = f"{total_unread} new · {active_count} active"
+    else:
+        active_label = "active conversation" if active_count == 1 else "active conversations"
+        label = f"{active_count} {active_label}"
+
+    with st.container(key="admin_inbox_bar"):
+        urgency = " urgent" if total_unread else ""
+        st.markdown(
+            f'<span class="admin-conversation-switcher-marker{urgency}"></span>',
+            unsafe_allow_html=True,
+        )
+        with st.popover(label):
+            st.caption("Open an active conversation. New user messages appear first.")
+            st.markdown(
+                f'<div class="admin-inbox-overview"><span><b>{active_count}</b>Active now</span>'
+                f'<span class="needs-reply"><b>{needs_reply_count}</b>Need a reply</span></div>',
+                unsafe_allow_html=True,
+            )
+            for conversation in conversations:
+                session_id = str(conversation.get("session_id") or "")
+                user_id = int(conversation.get("user_id") or 0)
+                unread_count = int(conversation.get("unread_count") or 0)
+                display_name = str(
+                    conversation.get("display_name")
+                    or conversation.get("email")
+                    or "User"
+                )
+                mode = str(
+                    conversation.get("conversation_mode")
+                    or conversation.get("mode")
+                    or "listener"
+                ).title()
+                character = str(conversation.get("character") or "").replace("_", " ").title()
+                control_label = (
+                    "Human control"
+                    if str(conversation.get("control_mode") or "ai") == "human"
+                    else "AI responding"
+                )
+                badge = (
+                    f"Needs reply · {unread_count} new"
+                    if conversation.get("needs_reply")
+                    else f"{unread_count} new"
+                    if unread_count
+                    else "Active"
+                )
+                preview = " ".join(
+                    str(
+                        conversation.get("latest_message_preview")
+                        or "Open this conversation to review the latest messages."
+                    ).split()
+                )
+                if len(preview) > 110:
+                    preview = f"{preview[:107].rstrip()}…"
+                item_class = " unread" if unread_count else ""
+                mode_label = f"{mode}: {character}" if mode == "Partner" and character else mode
+                st.markdown(
+                    f'<div class="admin-conversation-menu-item{item_class}">'
+                    f'<div class="admin-conversation-menu-title"><strong>{html.escape(display_name)}</strong>'
+                    f'<b>{html.escape(badge)}</b></div>'
+                    f'<div class="admin-conversation-menu-meta"><span>{html.escape(mode_label)}</span>'
+                    f'<span>{html.escape(control_label)}</span>'
+                    f'<span>{html.escape(admin_time(conversation.get("last_activity")))}</span></div>'
+                    f'<p>{html.escape(preview)}</p></div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    "Open conversation",
+                    key=(
+                        f"open_admin_unread_{session_id}"
+                        if unread_count
+                        else f"open_admin_active_{session_id}"
+                    ),
+                    width="stretch",
+                ):
+                    open_admin_conversation_from_switcher(user_id, session_id)
 
 
 def admin_time(value: Any) -> str:
@@ -7687,23 +9441,30 @@ def render_admin_left_rail(summary: dict[str, Any], active_count: int) -> None:
             page,
             key=f"admin_nav_{page}",
             type="primary" if st.session_state.admin_page == page else "secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             admin_go_to(page)
     st.markdown('<div class="admin-rail-label">Security</div>', unsafe_allow_html=True)
-    if st.button(
-        "Audit log",
-        key="admin_nav_Audit log",
-        type="primary" if st.session_state.admin_page == "Audit log" else "secondary",
-        use_container_width=True,
-    ):
-        admin_go_to("Audit log")
+    for page in ("IP blocking", "Audit log"):
+        label = (
+            f"IP blocking · {int(summary.get('blocked_ips', 0))}"
+            if page == "IP blocking"
+            else page
+        )
+        if st.button(
+            label,
+            key=f"admin_nav_{page}",
+            type="primary" if st.session_state.admin_page == page else "secondary",
+            width="stretch",
+        ):
+            admin_go_to(page)
     st.markdown(
         f"""<div class="admin-rail-foot"><strong>{summary.get('consenting_users', 0):,}</strong> accounts are available for review.<br>
+        <strong>{summary.get('pending_access_users', 0):,}</strong> account(s) are on the waitlist.<br>
         <strong>{summary.get('pending_terms_users', 0):,}</strong> account(s) still need to accept the current Terms.</div>""",
         unsafe_allow_html=True,
     )
-    if st.button("Lock workspace", key="admin_lock_workspace_v3", use_container_width=True):
+    if st.button("Lock workspace", key="admin_lock_workspace_v3", width="stretch"):
         forget_admin_browser_login()
         st.rerun()
 
@@ -7711,14 +9472,13 @@ def render_admin_left_rail(summary: dict[str, Any], active_count: int) -> None:
 def render_admin_mobile_nav() -> None:
     with st.container(key="admin_mobile_nav"):
         current = st.session_state.admin_page
-        selected = st.selectbox(
+        st.session_state.admin_mobile_page_picker = current
+        st.selectbox(
             "Administrator section",
             ADMIN_PAGES,
-            index=ADMIN_PAGES.index(current) if current in ADMIN_PAGES else 0,
             key="admin_mobile_page_picker",
+            on_change=admin_mobile_page_changed,
         )
-        if selected != current:
-            admin_go_to(selected)
 
 
 def render_admin_metrics(summary: dict[str, Any], active_count: int) -> None:
@@ -7728,6 +9488,7 @@ def render_admin_metrics(summary: dict[str, Any], active_count: int) -> None:
         ("All users", summary.get("total_users", 0)),
         ("Conversations", summary.get("reviewable_sessions", 0)),
         ("Messages", summary.get("reviewable_messages", 0)),
+        ("Waitlist", summary.get("pending_access_users", 0)),
         ("Terms update needed", summary.get("pending_terms_users", 0)),
     )
     cards = "".join(
@@ -7740,7 +9501,13 @@ def render_admin_metrics(summary: dict[str, Any], active_count: int) -> None:
 def admin_user_card(user: dict[str, Any], *, button_label: str, button_key: str) -> bool:
     current_terms = user.get("terms_version") == CURRENT_TERMS_VERSION
     can_review = bool(user.get("allow_admin_review") and user.get("store_chats"))
-    if current_terms:
+    if user.get("access_status") != "active":
+        slot = PREFERRED_TIME_SLOT_LABELS.get(
+            str(user.get("preferred_time_slot") or "flexible"),
+            PREFERRED_TIME_SLOT_LABELS["flexible"],
+        )
+        access = f"Waitlist · {slot}"
+    elif current_terms:
         access = "Review included"
     elif can_review:
         access = "Previous review consent · Terms update required"
@@ -7770,6 +9537,14 @@ def render_admin_overview(summary: dict[str, Any], users: list[dict[str, Any]], 
         "See account access, active conversations, and recent activity before opening a user record.",
     )
     render_admin_metrics(summary, len(active))
+    pending_access = int(summary.get("pending_access_users", 0))
+    if pending_access:
+        st.markdown(
+            f'<div class="admin-waitlist-strip"><strong>{pending_access} account(s) waiting for access.</strong><br>Open Users to review preferred times and activate an account with AI or human replies.</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Review waitlist", type="primary", key="overview_open_waitlist"):
+            admin_go_to("Users")
     live_visitors = int(summary.get("live_visitors", 0))
     if live_visitors:
         st.markdown(
@@ -7805,11 +9580,13 @@ def render_admin_overview(summary: dict[str, Any], users: list[dict[str, Any]], 
         stored = int(summary.get("stored_users", 0))
         review = int(summary.get("consenting_users", 0))
         intervention = int(summary.get("intervention_users", 0))
+        pending_access = int(summary.get("pending_access_users", 0))
         pending_terms = int(summary.get("pending_terms_users", 0))
         st.markdown(
             f"""<div class="admin-fact-list">
             <div><span>Stored history</span><strong>{stored:,} account(s)</strong></div>
             <div><span>Review available</span><strong>{review:,} account(s)</strong></div>
+            <div><span>Waitlist</span><strong>{pending_access:,} account(s)</strong></div>
             <div><span>Terms update required</span><strong>{pending_terms:,} account(s)</strong></div>
             <div><span>Live intervention</span><strong>{intervention:,} account(s)</strong></div>
             </div>""",
@@ -7904,9 +9681,98 @@ def render_admin_visitors() -> None:
         )
     st.caption(f"{len(filtered)} past visit(s) shown")
     if table_rows:
-        st.dataframe(table_rows, use_container_width=True, hide_index=True)
+        st.dataframe(table_rows, width="stretch", hide_index=True)
     else:
         st.info("No past visits match these filters.")
+
+
+def render_admin_ip_blocks() -> dict[str, Any]:
+    blocks = admin_json("GET", "/admin/ip-blocks", timeout=10) or []
+    admin_page_header(
+        "Website access",
+        "IP blocking",
+        "Block one exact IPv4 or IPv6 address from the public site, private app, downloads, and same-origin API.",
+    )
+    st.warning(
+        "Blocking takes effect across the website within a few seconds. Check the address carefully. "
+        "Everyone sharing that public IP will lose access. If it is your own IP, this administrator "
+        "session will also be disconnected."
+    )
+    with st.form("admin_create_ip_block"):
+        ip_address = st.text_input(
+            "IP address",
+            placeholder="203.0.113.42 or 2001:db8::42",
+            help="Enter one complete address. Masked visitor prefixes cannot be used here.",
+        )
+        note = st.text_input(
+            "Reason or reference",
+            placeholder="Optional private note",
+        )
+        submitted = st.form_submit_button(
+            "Block IP address",
+            type="primary",
+            width="stretch",
+        )
+    if submitted:
+        if admin_json(
+            "POST",
+            "/admin/ip-blocks",
+            {"ip_address": ip_address, "note": note},
+        ) is not None:
+            st.success("The IP address is blocked.")
+            st.rerun()
+
+    st.markdown(
+        '<div class="admin-section-title"><h2>Blocked addresses</h2><p>Exact addresses remain blocked until an administrator removes them.</p></div>',
+        unsafe_allow_html=True,
+    )
+    if not blocks:
+        st.markdown(
+            '<div class="admin-empty"><strong>No blocked IP addresses</strong>Add an address above to deny website access.</div>',
+            unsafe_allow_html=True,
+        )
+        return {"blocks": []}
+
+    for block in blocks:
+        block_id = int(block["id"])
+        pending = st.session_state.get("admin_pending_ip_unblock") == block_id
+        with st.container(border=True):
+            st.markdown('<span class="admin-card-marker"></span>', unsafe_allow_html=True)
+            copy_col, action_col = st.columns([4.2, 1.4])
+            with copy_col:
+                private_note = str(block.get("note") or "No reason recorded")
+                st.markdown(
+                    f"""<div class="admin-case-card"><h3>{html.escape(str(block.get('ip_address') or ''))}</h3>
+                    <p>{html.escape(private_note)} · blocked {html.escape(admin_time(block.get('created_at')))}</p></div>""",
+                    unsafe_allow_html=True,
+                )
+            with action_col:
+                if pending:
+                    if st.button(
+                        "Confirm unblock",
+                        type="primary",
+                        key=f"confirm_unblock_ip_{block_id}",
+                        width="stretch",
+                    ):
+                        if admin_json("DELETE", f"/admin/ip-blocks/{block_id}") is not None:
+                            st.session_state.admin_pending_ip_unblock = None
+                            st.success("The IP address can access the website again.")
+                            st.rerun()
+                    if st.button(
+                        "Cancel",
+                        key=f"cancel_unblock_ip_{block_id}",
+                        width="stretch",
+                    ):
+                        st.session_state.admin_pending_ip_unblock = None
+                        st.rerun()
+                elif st.button(
+                    "Unblock",
+                    key=f"unblock_ip_{block_id}",
+                    width="stretch",
+                ):
+                    st.session_state.admin_pending_ip_unblock = block_id
+                    st.rerun()
+    return {"blocks": blocks}
 
 
 def render_admin_app_usage() -> dict[str, Any]:
@@ -8025,14 +9891,92 @@ def render_admin_users(users: list[dict[str, Any]]) -> dict[str, Any]:
         "Users",
         "Find an account, check its privacy settings, and open its conversations in newest-first order.",
     )
+    access_settings = admin_json("GET", "/admin/access-settings") or {}
+    with st.form("admin_new_account_access_settings"):
+        require_approval = st.toggle(
+            "Put new accounts on the waitlist",
+            value=bool(
+                access_settings.get("require_approval_for_new_accounts", True)
+            ),
+            help="New users can sign in and see their waitlist status, but cannot open or start chats until activated.",
+        )
+        save_access_setting = st.form_submit_button("Save access setting")
+    if save_access_setting:
+        saved = admin_json(
+            "PUT",
+            "/admin/access-settings",
+            {"require_approval_for_new_accounts": require_approval},
+        )
+        if saved is not None:
+            st.success("New-account access setting saved.")
+            st.rerun()
+
     if not users:
         st.markdown('<div class="admin-empty"><strong>No user accounts</strong>Accounts will appear here after registration.</div>', unsafe_allow_html=True)
         return {}
+
+    pending_users = [
+        user for user in users if user.get("access_status") != "active"
+    ]
+    if pending_users:
+        st.markdown(
+            f'<div class="admin-waitlist-strip"><strong>{len(pending_users)} account(s) waiting for access</strong><br>Choose the starting reply mode, activate the account, and DilSe will send the activation email.</div>',
+            unsafe_allow_html=True,
+        )
+        for pending_user in pending_users:
+            user_id = int(pending_user["id"])
+            slot = PREFERRED_TIME_SLOT_LABELS.get(
+                str(pending_user.get("preferred_time_slot") or "flexible"),
+                PREFERRED_TIME_SLOT_LABELS["flexible"],
+            )
+            with st.container(border=True):
+                st.markdown('<span class="admin-card-marker"></span>', unsafe_allow_html=True)
+                st.markdown(
+                    f"""<div class="admin-case-card"><h3>{html.escape(str(pending_user.get('display_name') or 'Unnamed user'))}</h3>
+                    <p>{html.escape(str(pending_user.get('email') or ''))} · Requested {html.escape(slot)} · Joined {html.escape(admin_time(pending_user.get('created_at')))}</p></div>""",
+                    unsafe_allow_html=True,
+                )
+                with st.form(f"activate_waitlist_user_{user_id}"):
+                    response_label = st.radio(
+                        "Starting reply mode",
+                        ("AI replies", "Human replies"),
+                        horizontal=True,
+                        key=f"waitlist_response_mode_{user_id}",
+                    )
+                    activate = st.form_submit_button(
+                        "Activate account",
+                        type="primary",
+                        width="stretch",
+                    )
+                if activate:
+                    result = admin_json(
+                        "POST",
+                        f"/admin/users/{user_id}/approve",
+                        {
+                            "default_response_mode": (
+                                "human" if response_label == "Human replies" else "ai"
+                            )
+                        },
+                    )
+                    if result is not None:
+                        if result.get("email_sent"):
+                            st.success("Account activated and the user was emailed.")
+                        else:
+                            st.warning(
+                                result.get("email_error")
+                                or "Account activated. No activation email was sent."
+                            )
+                        st.rerun()
+
     search_col, access_col, country_col = st.columns([1.5, 1, 1])
     with search_col:
         query = st.text_input("Search users", placeholder="Name or email", key="admin_v3_user_search")
     with access_col:
-        access_filter = st.selectbox("Conversation access", ("All accounts", "Review available", "Terms update required"), key="admin_v3_access_filter")
+        access_filter = st.selectbox(
+            "Account status",
+            ("All accounts", "Active", "Waitlist", "Terms update required"),
+            key="admin_v3_access_filter",
+        )
     with country_col:
         countries = ("All countries", *sorted({str(item.get("country") or "Unknown") for item in users}))
         country_filter = st.selectbox("Country", countries, key="admin_v3_country_filter")
@@ -8040,9 +9984,14 @@ def render_admin_users(users: list[dict[str, Any]]) -> dict[str, Any]:
     filtered = []
     for user in users:
         matches_query = not query or query.lower() in f"{user.get('display_name', '')} {user.get('email', '')}".lower()
-        has_review = bool(user.get("allow_admin_review") and user.get("store_chats"))
+        is_active = user.get("access_status") == "active"
         needs_terms = user.get("terms_version") != CURRENT_TERMS_VERSION
-        matches_access = access_filter == "All accounts" or (access_filter == "Review available" and has_review) or (access_filter == "Terms update required" and needs_terms)
+        matches_access = (
+            access_filter == "All accounts"
+            or (access_filter == "Active" and is_active)
+            or (access_filter == "Waitlist" and not is_active)
+            or (access_filter == "Terms update required" and needs_terms)
+        )
         matches_country = country_filter == "All countries" or user.get("country") == country_filter
         if matches_query and matches_access and matches_country:
             filtered.append(user)
@@ -8069,7 +10018,11 @@ def render_admin_users(users: list[dict[str, Any]]) -> dict[str, Any]:
 
     detail = admin_json("GET", f"/admin/users/{selected_id}") or {}
     user_record = detail.get("user", selected_user)
-    can_review = bool(user_record.get("allow_admin_review") and user_record.get("store_chats"))
+    can_review = bool(
+        user_record.get("access_status") == "active"
+        and user_record.get("allow_admin_review")
+        and user_record.get("store_chats")
+    )
     sessions: list[dict[str, Any]] = []
     st.markdown('<div class="admin-section-title"><h2>Conversation history</h2><p>Newest activity appears first.</p></div>', unsafe_allow_html=True)
     if can_review:
@@ -8087,14 +10040,17 @@ def render_admin_users(users: list[dict[str, Any]]) -> dict[str, Any]:
                             unsafe_allow_html=True,
                         )
                     with action_col:
-                        if st.button("Open chat", key=f"user_open_session_{session['session_id']}", use_container_width=True):
-                            st.session_state.admin_selected_user_id = selected_id
-                            st.session_state.admin_selected_session_id = session["session_id"]
-                            admin_go_to("Conversations")
+                        if st.button("Open chat", key=f"user_open_session_{session['session_id']}", width="stretch"):
+                            open_admin_conversation_from_switcher(
+                                int(selected_id),
+                                str(session["session_id"]),
+                            )
         else:
             st.info("This account includes administrator review but has no stored conversations.")
     else:
-        if user_record.get("terms_version") != CURRENT_TERMS_VERSION:
+        if user_record.get("access_status") != "active":
+            st.info("Activate this account before starting or reviewing conversations.")
+        elif user_record.get("terms_version") != CURRENT_TERMS_VERSION:
             st.info("This account must accept the current Terms before its conversations become available for required administrator review.")
         else:
             st.info("Conversation history is temporarily unavailable. Current accounts normally include stored administrator review.")
@@ -8106,6 +10062,173 @@ def admin_session_label(session: dict[str, Any]) -> str:
     if len(preview) > 58:
         preview = f"{preview[:55].rstrip()}…"
     return f"{preview} · {admin_time(session.get('last_activity'))}"
+
+
+def render_admin_new_chat(users: list[dict[str, Any]]) -> None:
+    eligible_users = [
+        user
+        for user in users
+        if user.get("store_chats")
+        and user.get("access_status") == "active"
+        and user.get("allow_admin_review")
+        and user.get("allow_admin_intervention")
+        and user.get("terms_version") == CURRENT_TERMS_VERSION
+    ]
+    with st.expander("Start a new chat", expanded=False):
+        st.caption(
+            "Create a conversation in the user's account and send its first DilSe message. "
+            "The conversation starts under human control."
+        )
+        if not eligible_users:
+            st.info("No current account is available for administrator-started conversations.")
+            return
+
+        user_ids = [int(user["id"]) for user in eligible_users]
+        preferred_user_id = st.session_state.get("admin_selected_user_id")
+        user_col, mode_col = st.columns([1.5, 1])
+        with user_col:
+            user_id = st.selectbox(
+                "User",
+                user_ids,
+                index=(
+                    user_ids.index(preferred_user_id)
+                    if preferred_user_id in user_ids
+                    else 0
+                ),
+                format_func=lambda value: next(
+                    f"{user['display_name']} · {user['email']}"
+                    for user in eligible_users
+                    if user["id"] == value
+                ),
+                key="admin_new_chat_user",
+            )
+        with mode_col:
+            mode_label = st.radio(
+                "Conversation mode",
+                ("Listener", "Partner"),
+                horizontal=True,
+                key="admin_new_chat_mode",
+            )
+
+        mode = str(mode_label).lower()
+        persona_slug: str | None = None
+        scenario_slug: str | None = None
+        roleplay_intensity: str | None = None
+        roleplay_difficulty: str | None = None
+        character_description: str | None = None
+        if mode == "partner":
+            personas = [
+                item
+                for item in (admin_json("GET", "/admin/catalog/personas") or [])
+                if item.get("active")
+            ]
+            scenarios = [
+                item
+                for item in (admin_json("GET", "/admin/catalog/scenarios") or [])
+                if item.get("active")
+            ]
+            if not personas or not scenarios:
+                st.error("Active characters and Partner scenarios are required before starting this chat.")
+                return
+            persona_slugs = [str(item["slug"]) for item in personas]
+            scenario_slugs = [str(item["slug"]) for item in scenarios]
+            character_col, scenario_col = st.columns(2)
+            with character_col:
+                persona_slug = st.selectbox(
+                    "Character",
+                    persona_slugs,
+                    format_func=lambda value: next(
+                        str(item["name"]) for item in personas if item["slug"] == value
+                    ),
+                    key="admin_new_chat_persona",
+                )
+                selected_persona = next(
+                    item for item in personas if item["slug"] == persona_slug
+                )
+                st.caption(str(selected_persona.get("description") or ""))
+            with scenario_col:
+                default_scenario = (
+                    "practice_opening_up"
+                    if "practice_opening_up" in scenario_slugs
+                    else scenario_slugs[0]
+                )
+                scenario_slug = st.selectbox(
+                    "Conversation",
+                    scenario_slugs,
+                    index=scenario_slugs.index(default_scenario),
+                    format_func=lambda value: next(
+                        str(item["name"]) for item in scenarios if item["slug"] == value
+                    ),
+                    key="admin_new_chat_scenario",
+                )
+
+        with st.form("admin_new_chat_form", clear_on_submit=False):
+            if mode == "partner":
+                character_description = st.text_area(
+                    "Optional character details",
+                    placeholder="Add a name, speaking style, temperament, appearance, or shared context.",
+                    max_chars=CHARACTER_PROFILE_MAX_CHARS,
+                    key="admin_new_chat_character_details",
+                ).strip() or None
+                reaction_col, intimacy_col = st.columns(2)
+                with reaction_col:
+                    roleplay_difficulty = st.selectbox(
+                        "Character reaction",
+                        ("realistic", "supportive", "resistant"),
+                        format_func=str.title,
+                        key="admin_new_chat_difficulty",
+                    )
+                with intimacy_col:
+                    roleplay_intensity = st.selectbox(
+                        "Intimacy detail",
+                        ("explicit", "direct", "romantic"),
+                        format_func=str.title,
+                        key="admin_new_chat_intensity",
+                    )
+            opening_message = st.text_area(
+                "Opening message",
+                placeholder=(
+                    "Write the character's first message to the user."
+                    if mode == "partner"
+                    else "Write the first DilSe message to the user."
+                ),
+                height=110,
+                max_chars=8_000,
+                key="admin_new_chat_opening_message",
+            )
+            submitted = st.form_submit_button(
+                "Start chat and send message",
+                type="primary",
+                width="stretch",
+            )
+        if not submitted:
+            return
+        payload: dict[str, Any] = {
+            "user_id": int(user_id),
+            "mode": mode,
+            "opening_message": opening_message.strip(),
+        }
+        if mode == "partner":
+            payload.update(
+                {
+                    "persona": persona_slug,
+                    "scenario": scenario_slug,
+                    "roleplay_intensity": roleplay_intensity,
+                    "roleplay_difficulty": roleplay_difficulty,
+                    "character_description": character_description,
+                }
+            )
+        created = admin_json("POST", "/admin/sessions", payload, timeout=45)
+        if not created:
+            return
+        st.session_state.admin_reply_to = None
+        st.session_state.admin_pending_roman_urdu_review = None
+        st.session_state.admin_pending_voice_preview = None
+        st.toast("New conversation started")
+        open_admin_conversation_from_switcher(
+            int(user_id),
+            str(created["session_id"]),
+        )
 
 
 def render_admin_message_delete_control(
@@ -8134,11 +10257,14 @@ def render_admin_message_delete_control(
             )
             if result is not None:
                 st.session_state.admin_pending_message_delete = None
+                caches = dict(st.session_state.get("admin_transcript_cache") or {})
+                caches.pop(session_id, None)
+                st.session_state.admin_transcript_cache = caches
                 st.toast(f"Message {message_id} deleted")
                 st.rerun()
         if cancel_col.button(
             "Cancel",
-            use_container_width=True,
+            width="stretch",
             key=f"cancel_delete_message_{delete_target}",
         ):
             st.session_state.admin_pending_message_delete = None
@@ -8175,17 +10301,92 @@ def advance_admin_composer(
     st.session_state.admin_composer_retained_images = retained
 
 
+def preview_admin_composer_voice(
+    session_id: str,
+    payload: dict[str, Any],
+) -> None:
+    preview_request = {
+        key: payload[key]
+        for key in (
+            "content",
+            "voice_style",
+            "draft_source",
+            "recording_base64",
+            "recording_mime_type",
+            "recording_filename",
+        )
+        if payload.get(key) is not None
+    }
+    with st.spinner("Creating a private voice preview…"):
+        preview = admin_json(
+            "POST",
+            f"/admin/sessions/{session_id}/voice-preview",
+            preview_request,
+            timeout=90,
+        )
+    if preview is None:
+        return
+    send_payload = dict(payload)
+    for key in (
+        "recording_base64",
+        "recording_mime_type",
+        "recording_filename",
+        "voice_preview_base64",
+        "voice_preview_mime_type",
+        "voice_preview_filename",
+    ):
+        send_payload.pop(key, None)
+    transcript = str(preview.get("transcript") or "").strip()
+    send_payload.update(
+        {
+            "content": transcript,
+            "voice_preview_base64": preview["audio_base64"],
+            "voice_preview_mime_type": preview.get("audio_mime_type") or "audio/wav",
+            "voice_preview_filename": preview.get("audio_filename")
+            or "dilse-troy-preview.wav",
+        }
+    )
+    if not send_payload.get("original_content"):
+        send_payload["original_content"] = transcript
+    st.session_state.admin_pending_roman_urdu_review = None
+    st.session_state.admin_pending_voice_preview = {
+        "session_id": session_id,
+        "payload": send_payload,
+        "audio_base64": preview["audio_base64"],
+        "duration_seconds": float(preview.get("duration_seconds") or 0),
+        "voice_style": preview.get("voice_style") or "conversational",
+    }
+    st.rerun(scope="app")
+
+
 def send_admin_composer_payload(session_id: str, payload: dict[str, Any]) -> None:
-    if admin_json(
-        "POST",
-        f"/admin/sessions/{session_id}/messages",
-        payload,
-        timeout=45,
-    ) is None:
+    if payload.get("delivery_mode") in {"text_audio", "audio"}:
+        with st.spinner("Sending the voice note…"):
+            result = admin_json(
+                "POST",
+                f"/admin/sessions/{session_id}/messages",
+                payload,
+                timeout=90,
+            )
+    else:
+        result = admin_json(
+            "POST",
+            f"/admin/sessions/{session_id}/messages",
+            payload,
+            timeout=45,
+        )
+    if result is None:
         return
     st.session_state.admin_pending_roman_urdu_review = None
+    st.session_state.admin_pending_voice_preview = None
     st.session_state.admin_reply_to = None
     advance_admin_composer(session_id)
+    stage_admin_navigation(
+        "Conversations",
+        user_id=st.session_state.get("admin_selected_user_id"),
+        session_id=session_id,
+    )
+    persist_admin_navigation()
     st.toast("Message sent")
     st.rerun(scope="app")
 
@@ -8213,7 +10414,7 @@ def render_admin_transcript_composer(
 
     with st.container(key="admin_chat_composer"):
         st.markdown(
-            '<div class="admin-composer-label"><strong>Write the next DilSe message</strong><span>Links become clickable · JPG, PNG or WebP up to 5 MB</span></div>',
+            '<div class="admin-composer-label"><strong>Write the next DilSe message</strong><span>Type or record, then send text, generated audio, or both</span></div>',
             unsafe_allow_html=True,
         )
         if control_mode != "human":
@@ -8237,6 +10438,70 @@ def render_admin_transcript_composer(
                     {"mode": "human", "note": "Human intervention from conversation composer"},
                 ) is not None:
                     st.rerun(scope="app")
+            return
+
+        pending_voice = st.session_state.get("admin_pending_voice_preview") or {}
+        if pending_voice.get("session_id") == selected_session_id:
+            payload = dict(pending_voice.get("payload") or {})
+            audio_base64 = str(pending_voice.get("audio_base64") or "")
+            try:
+                audio_bytes = base64.b64decode(audio_base64, validate=True)
+            except (ValueError, binascii.Error):
+                st.session_state.admin_pending_voice_preview = None
+                st.error("The voice preview could not be opened. Create it again.")
+                st.rerun(scope="app")
+            style_copy = (
+                "Seductive"
+                if pending_voice.get("voice_style") == "seductive"
+                else "Natural"
+            )
+            delivery_copy = (
+                "Text + audio"
+                if payload.get("delivery_mode") == "text_audio"
+                else "Audio only"
+            )
+            duration = float(pending_voice.get("duration_seconds") or 0)
+            st.markdown(
+                '<div class="admin-voice-preview-title"><strong>Hear before sending</strong>'
+                '<span>This exact audio will be delivered</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.audio(audio_bytes, format="audio/wav")
+            st.caption(f"Troy · {style_copy} · {duration:.1f} sec · {delivery_copy}")
+            with st.expander("Words in this voice note", expanded=False):
+                st.write(str(payload.get("content") or ""))
+            send_col, regenerate_col, edit_col = st.columns([1.35, 1, .7])
+            if send_col.button(
+                "Send this audio",
+                type="primary",
+                width="stretch",
+                key=f"admin_send_voice_preview_{selected_session_id}",
+            ):
+                send_admin_composer_payload(selected_session_id, payload)
+            if regenerate_col.button(
+                "Regenerate",
+                width="stretch",
+                help="Create a different reading of the same words.",
+                key=f"admin_regenerate_voice_preview_{selected_session_id}",
+            ):
+                preview_admin_composer_voice(selected_session_id, payload)
+            if edit_col.button(
+                "Edit",
+                width="stretch",
+                key=f"admin_edit_voice_preview_{selected_session_id}",
+            ):
+                retained_image = {
+                    key: str(payload[key])
+                    for key in ("image_base64", "image_mime_type", "image_filename")
+                    if payload.get(key)
+                }
+                advance_admin_composer(
+                    selected_session_id,
+                    prefill=str(payload.get("content") or ""),
+                    retained_image=retained_image or None,
+                )
+                st.session_state.admin_pending_voice_preview = None
+                st.rerun(scope="app")
             return
 
         pending_review = st.session_state.get("admin_pending_roman_urdu_review") or {}
@@ -8267,11 +10532,26 @@ def render_admin_transcript_composer(
             payload = dict(pending_review.get("payload") or {})
             if payload.get("image_base64"):
                 st.caption("The attached image will be sent with either approved version.")
+            if payload.get("delivery_mode") in {"text_audio", "audio"}:
+                delivery_copy = (
+                    "text and audio"
+                    if payload.get("delivery_mode") == "text_audio"
+                    else "audio only"
+                )
+                voice_copy = (
+                    "seductive"
+                    if payload.get("voice_style") == "seductive"
+                    else "natural"
+                )
+                st.caption(
+                    f"Approval will create {delivery_copy} using the "
+                    f"{voice_copy} male voice."
+                )
             correction_col, original_col, edit_col = st.columns([1.2, 1.1, .9])
             if correction_col.button(
                 "Use correction",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key=f"admin_use_roman_urdu_{selected_session_id}",
             ):
                 payload.update(
@@ -8281,10 +10561,13 @@ def render_admin_transcript_composer(
                         "roman_urdu_review_status": "corrected",
                     }
                 )
-                send_admin_composer_payload(selected_session_id, payload)
+                if payload.get("delivery_mode") in {"text_audio", "audio"}:
+                    preview_admin_composer_voice(selected_session_id, payload)
+                else:
+                    send_admin_composer_payload(selected_session_id, payload)
             if original_col.button(
                 "Keep original",
-                use_container_width=True,
+                width="stretch",
                 key=f"admin_keep_original_{selected_session_id}",
             ):
                 payload.update(
@@ -8294,10 +10577,13 @@ def render_admin_transcript_composer(
                         "roman_urdu_review_status": "kept_original",
                     }
                 )
-                send_admin_composer_payload(selected_session_id, payload)
+                if payload.get("delivery_mode") in {"text_audio", "audio"}:
+                    preview_admin_composer_voice(selected_session_id, payload)
+                else:
+                    send_admin_composer_payload(selected_session_id, payload)
             if edit_col.button(
                 "Edit again",
-                use_container_width=True,
+                width="stretch",
                 key=f"admin_edit_review_{selected_session_id}",
             ):
                 retained_image = {
@@ -8355,65 +10641,178 @@ def render_admin_transcript_composer(
                 selected_session_id, {}
             )
         )
+        with st.container(key="admin_composer_controls"):
+            source_col, delivery_col, voice_col = st.columns(
+                [.72, 1.25, .68], gap="small"
+            )
+            with source_col:
+                st.caption("Draft")
+                draft_source_label = st.radio(
+                    "Draft with",
+                    options=["Type", "Record"],
+                    index=0,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key=f"admin_draft_source_{selected_session_id}_{nonce}",
+                )
+            draft_source = (
+                "recording" if draft_source_label == "Record" else "text"
+            )
+            delivery_options = (
+                ["Text + audio", "Audio only"]
+                if draft_source == "recording"
+                else ["Text", "Text + audio", "Audio only"]
+            )
+            with delivery_col:
+                st.caption("Send as")
+                delivery_label = st.radio(
+                    "Send as",
+                    options=delivery_options,
+                    index=0,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key=f"admin_delivery_mode_{selected_session_id}_{nonce}",
+                )
+        delivery_mode = {
+            "Text": "text",
+            "Text + audio": "text_audio",
+            "Audio only": "audio",
+        }[delivery_label or delivery_options[0]]
+        latest_mode = str((messages[-1] if messages else {}).get("mode") or "listener")
+        voice_style = None
+        if delivery_mode in {"text_audio", "audio"}:
+            voice_options = ["Natural", "Seductive"]
+            with voice_col:
+                st.caption("Troy voice")
+                voice_style_label = st.radio(
+                    "Voice style",
+                    options=voice_options,
+                    index=0,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    help=(
+                        f"Choose the Troy delivery style for this {latest_mode.title()} reply. "
+                        f"Audio drafts can contain up to {ADMIN_TTS_MAX_CHARACTERS} characters."
+                    ),
+                    key=f"admin_voice_style_{selected_session_id}_{nonce}",
+                )
+            voice_style = (
+                "seductive" if voice_style_label == "Seductive" else "conversational"
+            )
+        voice_recording = None
+        if draft_source == "recording":
+            st.caption(
+                "Record up to 90 seconds. DilSe transcribes it and replaces your "
+                "voice with the selected AI voice. Your original recording is not "
+                "attached to the chat."
+            )
+            voice_recording = st.audio_input(
+                "Record voice draft",
+                key=f"admin_voice_draft_{selected_session_id}_{nonce}",
+            )
+        remove_retained_image = False
+        image_file = None
         with st.form(
             f"admin_chat_composer_form_{selected_session_id}_{nonce}",
             clear_on_submit=False,
         ):
-            reply_text = st.text_area(
-                "Administrator message",
-                placeholder="Write a message or paste a link…",
-                label_visibility="collapsed",
-                height=76,
-                value=prefill,
-                key=f"admin_message_text_{selected_session_id}_{nonce}",
-            )
-            remove_retained_image = False
-            with st.expander("Image attachment", expanded=bool(retained_image)):
-                image_file = st.file_uploader(
-                    "Add or replace an image" if retained_image else "Add an image",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    accept_multiple_files=False,
-                    key=f"admin_chat_image_{selected_session_id}_{nonce}",
+            if draft_source == "text":
+                reply_text = st.text_area(
+                    "Administrator message",
+                    placeholder="Write a message or paste a link…",
+                    label_visibility="collapsed",
+                    height=60,
+                    value=prefill,
+                    key=f"admin_message_text_{selected_session_id}_{nonce}",
                 )
-                if retained_image:
-                    remove_retained_image = st.checkbox(
-                        f"Remove retained image: {retained_image.get('image_filename', 'attachment')}",
-                        key=f"admin_remove_retained_image_{selected_session_id}_{nonce}",
-                    )
-            review_enabled = st.toggle(
-                "Check Roman Urdu",
-                value=True,
-                help="Default on. You approve the corrected or original draft before anything is sent.",
-                key=f"admin_roman_urdu_check_{selected_session_id}",
-            )
-            review_col, direct_send_col = st.columns([1.2, 1])
-            with review_col:
+            else:
+                reply_text = ""
+            action_columns = st.columns([.8, .9, 1, 1.15], gap="small")
+            with action_columns[0]:
+                if delivery_mode != "audio":
+                    image_label = "Image ✓" if retained_image else "Image"
+                    with st.expander(image_label, expanded=False):
+                        image_file = st.file_uploader(
+                            "Replace image" if retained_image else "Add image",
+                            type=["jpg", "jpeg", "png", "webp"],
+                            accept_multiple_files=False,
+                            key=f"admin_chat_image_{selected_session_id}_{nonce}",
+                        )
+                        if retained_image:
+                            remove_retained_image = st.checkbox(
+                                f"Remove {retained_image.get('image_filename', 'image')}",
+                                key=f"admin_remove_retained_image_{selected_session_id}_{nonce}",
+                            )
+            with action_columns[1]:
+                review_enabled = st.toggle(
+                    "Roman Urdu",
+                    value=True,
+                    help="Check the wording and choose the corrected or original draft.",
+                    key=f"admin_roman_urdu_check_{selected_session_id}",
+                )
+            with action_columns[2]:
                 review_message = st.form_submit_button(
-                    "Review before sending",
+                    "Review words",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     disabled=not review_enabled,
                 )
-            with direct_send_col:
+            with action_columns[3]:
                 send_without_review = st.form_submit_button(
-                    "Send without review",
-                    use_container_width=True,
-                    help="Send the message exactly as written without calling the correction assistant.",
+                    "Make voice preview"
+                    if delivery_mode in {"text_audio", "audio"}
+                    else "Send now",
+                    width="stretch",
+                    help=(
+                        "Create the audio you can hear before sending."
+                        if delivery_mode in {"text_audio", "audio"}
+                        else "Send the message exactly as written."
+                    ),
                 )
         if not review_message and not send_without_review:
             return
-        if not reply_text.strip() and image_file is None and (
+        recording_bytes = b""
+        if draft_source == "recording":
+            if voice_recording is None:
+                st.warning("Record a voice draft before sending.")
+                return
+            recording_bytes = voice_recording.getvalue()
+            if len(recording_bytes) > 15 * 1024 * 1024:
+                st.warning("Recorded drafts must be 15 MB or smaller.")
+                return
+            if voice_recording.type != "audio/wav":
+                st.warning("The recorded draft must be a WAV file.")
+                return
+        if (
+            draft_source == "text"
+            and delivery_mode in {"text_audio", "audio"}
+            and not reply_text.strip()
+        ):
+            st.warning("Write the words that DilSe should speak.")
+            return
+        if (
+            delivery_mode in {"text_audio", "audio"}
+            and len(reply_text.strip()) > ADMIN_TTS_MAX_CHARACTERS
+        ):
+            st.warning(
+                f"Audio messages must be {ADMIN_TTS_MAX_CHARACTERS} characters or fewer."
+            )
+            return
+        if draft_source == "text" and not reply_text.strip() and image_file is None and (
             not retained_image or remove_retained_image
         ):
             st.warning("Write a message or attach an image.")
             return
         payload: dict[str, Any] = {
             "content": reply_text.strip(),
+            "delivery_mode": delivery_mode,
+            "voice_style": voice_style,
+            "draft_source": draft_source,
             "reply_to_message_id": (
                 int(admin_reply["message_id"]) if valid_reply else None
             ),
         }
-        if retained_image and not remove_retained_image:
+        if delivery_mode != "audio" and retained_image and not remove_retained_image:
             payload.update(retained_image)
         if image_file is not None:
             image_bytes = image_file.getvalue()
@@ -8428,6 +10827,30 @@ def render_admin_transcript_composer(
                     "image_base64": base64.b64encode(image_bytes).decode("ascii"),
                     "image_mime_type": image_file.type,
                     "image_filename": image_file.name,
+                }
+            )
+        if draft_source == "recording" and review_message and review_enabled:
+            with st.spinner("Transcribing the recording…"):
+                transcription = admin_json(
+                    "POST",
+                    f"/admin/sessions/{selected_session_id}/voice-transcription",
+                    {
+                        "audio_base64": base64.b64encode(recording_bytes).decode("ascii"),
+                        "audio_mime_type": "audio/wav",
+                        "audio_filename": voice_recording.name,
+                    },
+                    timeout=60,
+                )
+            if transcription is None:
+                return
+            reply_text = str(transcription.get("transcript") or "").strip()
+            payload["content"] = reply_text
+        elif draft_source == "recording":
+            payload.update(
+                {
+                    "recording_base64": base64.b64encode(recording_bytes).decode("ascii"),
+                    "recording_mime_type": "audio/wav",
+                    "recording_filename": voice_recording.name,
                 }
             )
         if review_message and review_enabled and reply_text.strip():
@@ -8450,57 +10873,156 @@ def render_admin_transcript_composer(
                 "payload": payload,
             }
             st.rerun(scope="app")
-        payload.update(
-            {
-                "original_content": reply_text.strip(),
-                "roman_urdu_review_status": "not_checked",
-            }
-        )
-        send_admin_composer_payload(selected_session_id, payload)
+        payload["roman_urdu_review_status"] = "not_checked"
+        if reply_text.strip():
+            payload["original_content"] = reply_text.strip()
+        if delivery_mode in {"text_audio", "audio"}:
+            preview_admin_composer_voice(selected_session_id, payload)
+        else:
+            send_admin_composer_payload(selected_session_id, payload)
 
 
-def admin_transcript_signature(messages: list[dict[str, Any]]) -> str:
-    """Track changes that need a full transcript redraw."""
-    return "|".join(
-        f"{message.get('id')}:{message.get('read_at') or ''}:{message.get('read_basis') or ''}"
-        for message in messages
+def admin_transcript_signature(detail: dict[str, Any]) -> str:
+    """Use the API's compact revision instead of hashing the full transcript."""
+    return str(detail.get("transcript_revision") or "")
+
+
+def transcript_latest_id(detail: dict[str, Any]) -> int:
+    try:
+        return int(admin_transcript_signature(detail).split(":", 2)[1])
+    except (IndexError, TypeError, ValueError):
+        messages = detail.get("messages") or []
+        return max((int(item.get("id") or 0) for item in messages), default=0)
+
+
+def merge_admin_transcript_detail(
+    session_id: str,
+    detail: dict[str, Any],
+) -> dict[str, Any]:
+    caches = dict(st.session_state.get("admin_transcript_cache") or {})
+    cached = dict(caches.get(session_id) or {})
+    current_messages = list(detail.get("messages") or [])
+    current_count = max(int(detail.get("message_count") or 0), len(current_messages))
+    current_latest_id = transcript_latest_id(detail)
+    cached_count = int(cached.get("message_count") or 0)
+    cached_latest_id = int(cached.get("latest_id") or 0)
+    can_keep_history = (
+        bool(cached)
+        and current_count >= cached_count
+        and current_latest_id >= cached_latest_id
     )
+    combined = [
+        *(list(cached.get("messages") or []) if can_keep_history else []),
+        *current_messages,
+    ]
+    messages_by_id = {
+        int(message["id"]): message
+        for message in combined
+        if message.get("id") is not None
+    }
+    merged_messages = [messages_by_id[key] for key in sorted(messages_by_id)]
+    caches[session_id] = {
+        "messages": merged_messages,
+        "message_count": current_count,
+        "latest_id": current_latest_id,
+    }
+    st.session_state.admin_transcript_cache = caches
+    merged_detail = dict(detail)
+    merged_detail["messages"] = merged_messages
+    return merged_detail
+
+
+def load_earlier_admin_messages(session_id: str, before_id: int) -> bool:
+    older_detail = admin_json(
+        "GET",
+        f"/admin/sessions/{session_id}/detail?record_view=false"
+        f"&message_limit={ADMIN_TRANSCRIPT_PAGE_SIZE}&before_id={before_id}",
+    ) or {}
+    older_messages = list(older_detail.get("messages") or [])
+    if not older_messages:
+        return False
+    caches = dict(st.session_state.get("admin_transcript_cache") or {})
+    cached = dict(caches.get(session_id) or {})
+    combined = [*older_messages, *list(cached.get("messages") or [])]
+    messages_by_id = {
+        int(message["id"]): message
+        for message in combined
+        if message.get("id") is not None
+    }
+    cached["messages"] = [messages_by_id[key] for key in sorted(messages_by_id)]
+    cached["message_count"] = max(
+        int(cached.get("message_count") or 0),
+        int(older_detail.get("message_count") or 0),
+        len(cached["messages"]),
+    )
+    cached["latest_id"] = max(
+        int(cached.get("latest_id") or 0),
+        transcript_latest_id(older_detail),
+    )
+    caches[session_id] = cached
+    st.session_state.admin_transcript_cache = caches
+    return True
 
 
 @st.fragment(run_every="1s")
 def render_admin_live_status(
     selected_session_id: str,
-    selected_user: dict[str, Any],
     selected_session: dict[str, Any],
     loaded_transcript_signature: str,
 ) -> None:
-    detail = admin_json(
+    status = admin_json(
         "GET",
-        f"/admin/sessions/{selected_session_id}/detail?record_view=false",
+        f"/admin/sessions/{selected_session_id}/status",
     ) or {}
-    messages = list(detail.get("messages") or [])
-    current_signature = admin_transcript_signature(messages)
-    if current_signature != loaded_transcript_signature:
+    current_signature = admin_transcript_signature(status)
+    nonce = int(
+        (st.session_state.get("admin_composer_nonces") or {}).get(selected_session_id, 0)
+    )
+    recording_open = st.session_state.get(
+        f"admin_draft_source_{selected_session_id}_{nonce}"
+    ) == "Record"
+    # Keep the recorder mounted until the administrator leaves the recording draft.
+    if current_signature != loaded_transcript_signature and not recording_open:
         st.rerun(scope="app")
     mode = str(selected_session.get("mode") or "listener").title()
     scenario = str(selected_session.get("scenario") or "open conversation").replace("_", " ").title()
-    control_mode = str((detail.get("session_control") or {}).get("mode") or "ai").upper()
+    control_mode = str(status.get("control_mode") or "ai").upper()
     preview = " ".join(str(selected_session.get("first_user_message") or "Conversation").split())
-    typing_status = ""
-    if detail.get("user_typing"):
-        typing_name = html.escape(str(selected_user.get("display_name") or "User"))
-        typing_status = (
+    st.markdown(
+        f"""<div class="admin-transcript-head"><div><strong>{html.escape(preview)}</strong>
+        <span>{html.escape(mode)} · {html.escape(scenario)} · {int(status.get('message_count') or 0)} messages · replies handled by {html.escape(control_mode)}</span></div>
+        <div class="admin-transcript-status"><span class="admin-session-id">{html.escape(selected_session_id[-8:])}</span></div></div>""",
+        unsafe_allow_html=True,
+    )
+@st.fragment(run_every="2s")
+def render_admin_composer_typing_status(
+    selected_session_id: str,
+    selected_user: dict[str, Any],
+) -> None:
+    """Show current user typing presence at the administrator reply point."""
+    try:
+        response = request_api(
+            "GET",
+            f"/admin/sessions/{selected_session_id}/typing",
+            admin=True,
+            timeout=5,
+        )
+    except requests.RequestException:
+        return
+    if response.status_code != 200:
+        return
+    status = response.json()
+    if not status.get("user_typing"):
+        return
+    typing_name = html.escape(str(selected_user.get("display_name") or "User"))
+    with st.container(key="admin_composer_presence"):
+        st.markdown(
             '<div class="admin-user-typing" role="status" aria-live="polite">'
             '<span class="admin-typing-bubble" aria-hidden="true">'
             '<span class="admin-typing-dots"><i></i><i></i><i></i></span></span>'
-            f'<span><strong>{typing_name}</strong> is typing…</span></div>'
+            f'<span><strong>{typing_name}</strong> is typing…</span></div>',
+            unsafe_allow_html=True,
         )
-    st.markdown(
-        f"""<div class="admin-transcript-head"><div><strong>{html.escape(preview)}</strong>
-        <span>{html.escape(mode)} · {html.escape(scenario)} · {len(messages)} messages · replies handled by {html.escape(control_mode)}</span></div>
-        <div class="admin-transcript-status"><span class="admin-session-id">{html.escape(selected_session_id[-8:])}</span>{typing_status}</div></div>""",
-        unsafe_allow_html=True,
-    )
 
 
 def render_admin_transcript(
@@ -8510,7 +11032,9 @@ def render_admin_transcript(
     detail: dict[str, Any],
 ) -> None:
     """Render stable message and audio controls outside the live polling fragment."""
+    set_message_media_scope(f"admin:{selected_session_id}")
     messages = list(detail.get("messages") or [])
+    total_message_count = max(int(detail.get("message_count") or 0), len(messages))
     if selected_session.get("character_description"):
         with st.expander("User-defined roleplay character"):
             st.write(selected_session["character_description"])
@@ -8595,6 +11119,18 @@ def render_admin_transcript(
                         st.rerun(scope="app")
                     render_admin_message_delete_control(selected_session_id, message, source)
             follow_latest_chat_message("admin", selected_session_id, messages)
+        before_id = transcript_history_event(
+            "admin",
+            selected_session_id,
+            f"admin_chat_transcript_{selected_session_id}",
+            messages,
+            total_message_count,
+        )
+        if before_id is not None and load_earlier_admin_messages(
+            selected_session_id,
+            before_id,
+        ):
+            st.rerun(scope="app")
     show_admin_chat_unread_badge(selected_session_id, messages)
 
 
@@ -8602,18 +11138,31 @@ def render_admin_conversations(users: list[dict[str, Any]]) -> dict[str, Any]:
     admin_page_header(
         "Case review",
         "Conversations",
-        "Choose a user first, then open one stored session. The transcript matches the messages shown in that user’s chat.",
+        "Start a new chat or open a stored session. The transcript matches the messages shown in that user’s account.",
     )
+    render_admin_new_chat(users)
     reviewable = [item for item in users if item.get("allow_admin_review") and item.get("store_chats")]
     if not reviewable:
         st.markdown('<div class="admin-empty"><strong>No reviewable conversations</strong>No account has stored conversation history available for administrator review.</div>', unsafe_allow_html=True)
+        st.session_state.admin_navigation_target = None
         return {}
     ids = [item["id"] for item in reviewable]
+    navigation_target = st.session_state.get("admin_navigation_target")
+    if not isinstance(navigation_target, dict) or navigation_target.get("page") != "Conversations":
+        navigation_target = {}
+    target_user_id = navigation_target.get("user_id")
+    if target_user_id in ids:
+        st.session_state.admin_selected_user_id = target_user_id
+        st.session_state.admin_case_user_picker = target_user_id
+    elif st.session_state.get("admin_case_user_picker") not in ids:
+        current_user_id = st.session_state.get("admin_selected_user_id")
+        st.session_state.admin_case_user_picker = (
+            current_user_id if current_user_id in ids else ids[0]
+        )
     current_user_id = st.session_state.get("admin_selected_user_id")
     selected_user_id = st.selectbox(
         "User",
         ids,
-        index=ids.index(current_user_id) if current_user_id in ids else 0,
         format_func=lambda value: next(f"{u['display_name']} · {u['email']}" for u in reviewable if u["id"] == value),
         key="admin_case_user_picker",
     )
@@ -8622,39 +11171,63 @@ def render_admin_conversations(users: list[dict[str, Any]]) -> dict[str, Any]:
         st.session_state.admin_selected_session_id = None
         st.session_state.admin_reply_to = None
         st.session_state.admin_pending_roman_urdu_review = None
+        st.session_state.admin_pending_voice_preview = None
     selected_user = next(item for item in reviewable if item["id"] == selected_user_id)
     sessions = admin_json("GET", f"/admin/users/{selected_user_id}/sessions") or []
     if not sessions:
+        st.session_state.admin_navigation_target = None
         st.info("This account includes administrator review but has no stored conversations.")
         return {"user": selected_user, "sessions": []}
     session_ids = [item["session_id"] for item in sessions]
+    target_session_id = navigation_target.get("session_id")
+    if (
+        navigation_target.get("user_id") == selected_user_id
+        and target_session_id in session_ids
+    ):
+        st.session_state.admin_selected_session_id = target_session_id
+        st.session_state.admin_case_session_picker = target_session_id
+    elif st.session_state.get("admin_case_session_picker") not in session_ids:
+        current_session_id = st.session_state.get("admin_selected_session_id")
+        st.session_state.admin_case_session_picker = (
+            current_session_id
+            if current_session_id in session_ids
+            else session_ids[0]
+        )
     current_session_id = st.session_state.get("admin_selected_session_id")
     selected_session_id = st.selectbox(
         "Conversation, newest first",
         session_ids,
-        index=session_ids.index(current_session_id) if current_session_id in session_ids else 0,
         format_func=lambda value: admin_session_label(next(s for s in sessions if s["session_id"] == value)),
         key="admin_case_session_picker",
     )
     if selected_session_id != current_session_id:
         st.session_state.admin_reply_to = None
         st.session_state.admin_pending_roman_urdu_review = None
+        st.session_state.admin_pending_voice_preview = None
     st.session_state.admin_selected_user_id = selected_user_id
     st.session_state.admin_selected_session_id = selected_session_id
+    st.session_state.admin_navigation_target = None
     persist_admin_navigation()
     selected_session = next(item for item in sessions if item["session_id"] == selected_session_id)
-    detail = admin_json("GET", f"/admin/sessions/{selected_session_id}/detail") or {}
+    detail = admin_json(
+        "GET",
+        f"/admin/sessions/{selected_session_id}/detail?message_limit={ADMIN_TRANSCRIPT_PAGE_SIZE}",
+    ) or {}
+    detail = merge_admin_transcript_detail(selected_session_id, detail)
     render_admin_live_status(
         selected_session_id,
-        selected_user,
         selected_session,
-        admin_transcript_signature(list(detail.get("messages") or [])),
+        admin_transcript_signature(detail),
     )
     render_admin_transcript(
         selected_session_id,
         selected_user,
         selected_session,
         detail,
+    )
+    render_admin_composer_typing_status(
+        selected_session_id,
+        selected_user,
     )
     render_admin_transcript_composer(
         selected_session_id,
@@ -8691,10 +11264,11 @@ def render_admin_live(active: list[dict[str, Any]]) -> dict[str, Any]:
                     unsafe_allow_html=True,
                 )
             with action_col:
-                if st.button("Open live chat", key=f"open_live_{session['session_id']}", type="primary" if session.get("control_mode") == "human" else "secondary", use_container_width=True):
-                    st.session_state.admin_selected_user_id = session["user_id"]
-                    st.session_state.admin_selected_session_id = session["session_id"]
-                    admin_go_to("Conversations")
+                if st.button("Open live chat", key=f"open_live_{session['session_id']}", type="primary" if session.get("control_mode") == "human" else "secondary", width="stretch"):
+                    open_admin_conversation_from_switcher(
+                        int(session["user_id"]),
+                        str(session["session_id"]),
+                    )
     return {"active": active}
 
 
@@ -8985,15 +11559,22 @@ def render_admin_inspector(page: str, context: dict[str, Any], summary: dict[str
         detail = context.get("detail") or {}
         consent = detail.get("latest_consent") or {}
         current_terms = user.get("terms_version") == CURRENT_TERMS_VERSION
+        access_active = user.get("access_status") == "active"
+        preferred_time = PREFERRED_TIME_SLOT_LABELS.get(
+            str(user.get("preferred_time_slot") or "flexible"),
+            PREFERRED_TIME_SLOT_LABELS["flexible"],
+        )
         review_status = "Included" if current_terms else ("Previously allowed" if user.get("allow_admin_review") else "Awaiting Terms update")
         st.markdown(f'<div class="admin-inspector-head"><span>Selected account</span><strong>{html.escape(str(user.get("display_name") or "User"))}</strong><p>{html.escape(str(user.get("email") or ""))}</p></div>', unsafe_allow_html=True)
         st.markdown(
             f"""<div class="admin-fact-list">
             <div><span>Location</span><strong>{html.escape(str(user.get('country') or 'Unknown'))}</strong></div>
             <div><span>Language</span><strong>{html.escape(str(user.get('language') or 'Not set'))}</strong></div>
+            <div><span>Account access</span><strong>{'Active' if access_active else 'Waitlist'}</strong></div>
+            <div><span>Preferred time</span><strong>{html.escape(preferred_time)}</strong></div>
             <div><span>Storage</span><strong>{'Enabled' if user.get('store_chats') else 'Off'} · {int(user.get('retention_days') or 0)} day retention</strong></div>
             <div><span>Administrator review</span><strong>{html.escape(review_status)}</strong></div>
-            <div><span>Active conversation access</span><strong>{'Included' if current_terms else 'Terms update required'}</strong></div>
+            <div><span>Active conversation access</span><strong>{'Included' if access_active and current_terms else ('Waitlist' if not access_active else 'Terms update required')}</strong></div>
             <div><span>New conversation control</span><strong>{'Human by default' if user.get('default_human_control') else 'AI by default'}</strong></div>
             <div><span>Terms version</span><strong>{html.escape(str(user.get('terms_version') or consent.get('version') or 'Update required'))}</strong></div>
             </div>""",
@@ -9009,6 +11590,22 @@ def render_admin_inspector(page: str, context: dict[str, Any], summary: dict[str
             <div><span>Live window</span><strong>60 seconds</strong></div>
             <div><span>Retention</span><strong>30 days</strong></div>
             <div><span>IP detail</span><strong>IPv4 /24 · IPv6 /48</strong></div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+        return
+    if page == "IP blocking":
+        st.markdown(
+            '<div class="admin-inspector-head"><span>Access enforcement</span><strong>Exact address match</strong><p>The gateway checks Railway’s trusted client address before serving the site. Active app connections are checked every five seconds.</p></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""<div class="admin-fact-list">
+            <div><span>Blocked addresses</span><strong>{int(summary.get('blocked_ips', 0)):,}</strong></div>
+            <div><span>Public pages</span><strong>Blocked</strong></div>
+            <div><span>Private web app</span><strong>Blocked</strong></div>
+            <div><span>Downloads and API</span><strong>Blocked</strong></div>
+            <div><span>Match type</span><strong>Exact IPv4 or IPv6</strong></div>
             </div>""",
             unsafe_allow_html=True,
         )
@@ -9053,7 +11650,16 @@ def render_admin_inspector(page: str, context: dict[str, Any], summary: dict[str
 
 
 def render_admin_workspace_v3() -> None:
+    draft_script = (Path(__file__).parent / "components" / "admin_draft_retention.js").read_text()
+    authenticated = bool(st.session_state.admin_key or st.session_state.admin_authenticated)
+    st.html(
+        '<script>'
+        + draft_script.replace("DILSE_ADMIN_DRAFT_AUTHENTICATED", json.dumps(authenticated))
+        + '</script>',
+        unsafe_allow_javascript=True,
+    )
     restore_admin_navigation()
+    synchronise_admin_page_picker()
     if not (st.session_state.admin_key or st.session_state.admin_authenticated):
         logo_uri = image_data_uri(str(LOGO_PATH), int(LOGO_PATH.stat().st_mtime))
         st.markdown(
@@ -9082,6 +11688,7 @@ def render_admin_workspace_v3() -> None:
         st.session_state.admin_page = "Overview"
     users = admin_json("GET", "/admin/users") or []
     active = admin_json("GET", "/admin/sessions/active?minutes=60") or []
+    render_admin_inbox_notification()
     left, centre, right = st.columns([1.02, 3.5, 1.42], gap="medium")
     with left:
         render_admin_left_rail(summary, len(active))
@@ -9094,6 +11701,8 @@ def render_admin_workspace_v3() -> None:
         elif page == "Visitors":
             render_admin_visitors()
             page_context = {}
+        elif page == "IP blocking":
+            page_context = render_admin_ip_blocks()
         elif page == "App usage":
             page_context = render_admin_app_usage()
         elif page == "Users":
@@ -9126,6 +11735,10 @@ if st.query_params.get("admin") == "1":
     render_admin_workspace_v3()
     st.stop()
 
+if st.session_state.account_deletion_receipt:
+    render_account_deletion_confirmation(st.session_state.account_deletion_receipt)
+    st.stop()
+
 ensure_browser_identity()
 
 if not load_user():
@@ -9139,6 +11752,11 @@ if not load_user():
         st.error("DilSe cannot reach the account service right now. Your sign-in is still saved. Refresh this page in a moment.")
     else:
         render_auth()
+    st.stop()
+
+if st.session_state.user.get("access_status") != "active":
+    track_visitor_presence("Account waitlist")
+    render_waitlist()
     st.stop()
 
 if st.session_state.user.get("requires_terms_acceptance"):

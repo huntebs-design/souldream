@@ -15,16 +15,18 @@ import secrets
 import sqlite3
 import time
 import wave
+from collections import deque
 from contextlib import asynccontextmanager, closing, suppress
 from datetime import datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Callable, Literal
 
 import requests
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from groq import AsyncGroq, RateLimitError as GroqRateLimitError
 from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
@@ -59,6 +61,25 @@ MOBILE_PUSH_NOTIFICATION_POLL_SECONDS = min(
     max(float(os.getenv("MOBILE_PUSH_NOTIFICATION_POLL_SECONDS", "2")), 2.0), 60.0
 )
 RESEND_API_URL = "https://api.resend.com/emails"
+ACCOUNT_DELETION_REASON_LABELS = {
+    "privacy_or_trust": "Privacy or trust concerns",
+    "response_quality": "The responses were not useful",
+    "no_longer_needed": "I no longer need DilSe",
+    "hard_to_use": "The app was difficult to use",
+    "slow_or_unreliable": "The app was slow or unreliable",
+    "other": "Another reason",
+    "prefer_not_to_say": "Prefer not to say",
+}
+PREFERRED_TIME_SLOT_LABELS = {
+    "early_morning": "2:00 AM to 6:00 AM PKT",
+    "morning": "6:00 AM to 10:00 AM PKT",
+    "midday": "10:00 AM to 2:00 PM PKT",
+    "afternoon": "2:00 PM to 6:00 PM PKT",
+    "evening": "6:00 PM to 10:00 PM PKT",
+    "late_evening": "10:00 PM to 2:00 AM PKT",
+    "flexible": "Flexible or varies",
+}
+NEW_ACCOUNT_APPROVAL_SETTING = "new_account_approval_required"
 TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 TELEGRAM_OUTBOX_POLL_SECONDS = min(
     max(float(os.getenv("TELEGRAM_OUTBOX_POLL_SECONDS", "1.5")), 0.5), 10.0
@@ -74,6 +95,34 @@ ADMIN_IMAGE_MIME_TYPES = {
 }
 USER_VOICE_NOTE_MAX_BYTES = 15 * 1024 * 1024
 USER_VOICE_NOTE_MAX_SECONDS = 180
+ADMIN_VOICE_DRAFT_MAX_SECONDS = 90
+ADMIN_TTS_MAX_CHARACTERS = 600
+ADMIN_TTS_CHUNK_CHARACTERS = 180
+AUTH_RATE_LIMIT_WINDOW_SECONDS = 10 * 60
+GROQ_STT_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo").strip()
+GROQ_TTS_API_URL = "https://api.groq.com/openai/v1/audio/speech"
+GROQ_TTS_MODEL = os.getenv(
+    "GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english"
+).strip()
+GROQ_TTS_MALE_VOICES = frozenset({"austin", "daniel", "troy"})
+_configured_natural_voice = os.getenv(
+    "GROQ_TTS_NATURAL_VOICE",
+    os.getenv("GROQ_TTS_CONVERSATIONAL_VOICE", "troy"),
+).strip().lower()
+_configured_seductive_voice = os.getenv(
+    "GROQ_TTS_SEDUCTIVE_VOICE", "troy"
+).strip().lower()
+GROQ_TTS_NATURAL_VOICE = (
+    _configured_natural_voice
+    if _configured_natural_voice in GROQ_TTS_MALE_VOICES
+    else "troy"
+)
+GROQ_TTS_SEDUCTIVE_VOICE = (
+    _configured_seductive_voice
+    if _configured_seductive_voice in GROQ_TTS_MALE_VOICES
+    else "troy"
+)
 CONSENT_VERSION = "2026-08-10-terms-v6"
 LEGACY_EXPERIENCE_VERSION = 1
 CURRENT_EXPERIENCE_VERSION = 2
@@ -422,6 +471,15 @@ class RegisterRequest(BaseModel):
     display_name: str = Field(min_length=1, max_length=60)
     language: str = Field(default="English", max_length=40)
     country: str = Field(default="Pakistan", max_length=40)
+    preferred_time_slot: Literal[
+        "early_morning",
+        "morning",
+        "midday",
+        "afternoon",
+        "evening",
+        "late_evening",
+        "flexible",
+    ] = "flexible"
     terms_accepted: bool
 
     @field_validator("display_name")
@@ -467,6 +525,36 @@ class VisitorHeartbeatRequest(BaseModel):
         return cleaned
 
 
+class VisitorIPAccessCheckRequest(BaseModel):
+    ip_address: str = Field(min_length=2, max_length=64)
+
+    @field_validator("ip_address")
+    @classmethod
+    def valid_ip_address(cls, value: str) -> str:
+        normalized = canonical_ip_address(value)
+        if not normalized:
+            raise ValueError("Enter a valid IPv4 or IPv6 address")
+        return normalized
+
+
+class AdminIPBlockCreate(BaseModel):
+    ip_address: str = Field(min_length=2, max_length=64)
+    note: str = Field(default="", max_length=500)
+
+    @field_validator("ip_address")
+    @classmethod
+    def valid_ip_address(cls, value: str) -> str:
+        normalized = canonical_ip_address(value)
+        if not normalized:
+            raise ValueError("Enter a valid IPv4 or IPv6 address")
+        return normalized
+
+    @field_validator("note")
+    @classmethod
+    def clean_note(cls, value: str) -> str:
+        return " ".join(value.split())
+
+
 class TypingUpdate(BaseModel):
     is_typing: bool
 
@@ -489,6 +577,8 @@ class UserView(BaseModel):
     terms_version: str | None
     requires_terms_acceptance: bool
     experience_version: int
+    access_status: Literal["pending", "active"]
+    preferred_time_slot: str
     created_at: str
 
 
@@ -589,7 +679,23 @@ class TermsAcceptance(BaseModel):
 
 
 class DeleteAccountRequest(BaseModel):
-    password: str
+    password: str = Field(min_length=1, max_length=200)
+    departure_reason: Literal[
+        "privacy_or_trust",
+        "response_quality",
+        "no_longer_needed",
+        "hard_to_use",
+        "slow_or_unreliable",
+        "other",
+        "prefer_not_to_say",
+    ] | None = None
+
+
+class AccountDeletionResponse(BaseModel):
+    deleted_at: str
+    confirmation_reference: str
+    email_sent: bool
+    departure_reason: str
 
 
 class HistoryItem(BaseModel):
@@ -765,6 +871,14 @@ class UserPromptControlRequest(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
+class AdminAccessSettingsUpdate(BaseModel):
+    require_approval_for_new_accounts: bool
+
+
+class AdminUserApprovalRequest(BaseModel):
+    default_response_mode: Literal["ai", "human"] = "ai"
+
+
 class AdminSessionMessage(BaseModel):
     content: str = Field(default="", max_length=8_000)
     original_content: str | None = Field(default=None, max_length=8_000)
@@ -775,6 +889,15 @@ class AdminSessionMessage(BaseModel):
     image_base64: str | None = Field(default=None, max_length=7_100_000)
     image_mime_type: Literal["image/jpeg", "image/png", "image/webp"] | None = None
     image_filename: str | None = Field(default=None, max_length=180)
+    delivery_mode: Literal["text", "text_audio", "audio"] = "text"
+    voice_style: Literal["conversational", "seductive"] | None = None
+    draft_source: Literal["text", "recording"] = "text"
+    recording_base64: str | None = Field(default=None, max_length=21_000_000)
+    recording_mime_type: Literal["audio/wav"] | None = None
+    recording_filename: str | None = Field(default=None, max_length=180)
+    voice_preview_base64: str | None = Field(default=None, max_length=21_000_000)
+    voice_preview_mime_type: Literal["audio/wav"] | None = None
+    voice_preview_filename: str | None = Field(default=None, max_length=180)
 
     @model_validator(mode="after")
     def validate_message_or_image(self) -> "AdminSessionMessage":
@@ -786,12 +909,170 @@ class AdminSessionMessage(BaseModel):
             raise ValueError("An image needs a filename and file type")
         if not has_image and (self.image_mime_type or self.image_filename):
             raise ValueError("Image details were provided without image data")
-        if not self.content and not has_image:
+        has_recording = bool(self.recording_base64)
+        if has_recording and (
+            self.recording_mime_type != "audio/wav" or not self.recording_filename
+        ):
+            raise ValueError("A recording needs a filename and WAV file type")
+        if not has_recording and (
+            self.recording_mime_type or self.recording_filename
+        ):
+            raise ValueError("Recording details were provided without audio data")
+        has_voice_preview = bool(self.voice_preview_base64)
+        if has_voice_preview and (
+            self.voice_preview_mime_type != "audio/wav"
+            or not self.voice_preview_filename
+        ):
+            raise ValueError("A voice preview needs a filename and WAV file type")
+        if not has_voice_preview and (
+            self.voice_preview_mime_type or self.voice_preview_filename
+        ):
+            raise ValueError("Voice preview details were provided without audio data")
+        if has_recording and has_voice_preview:
+            raise ValueError("Send either a recording or its approved voice preview")
+        if self.draft_source == "text" and has_recording:
+            raise ValueError("Choose Record before attaching a voice draft")
+        if self.draft_source == "recording" and self.content and has_recording:
+            raise ValueError("Send either a recording or its reviewed transcript, not both")
+        if self.draft_source == "recording" and self.delivery_mode == "text":
+            raise ValueError("A recorded draft must be converted to AI audio")
+        has_audio = self.delivery_mode in {"text_audio", "audio"}
+        if not self.content and has_audio and not has_recording:
+            raise ValueError("Write the words to use for the voice note")
+        if not self.content and not has_image and not has_recording:
             raise ValueError("Write a message or attach an image")
+        if has_audio and len(self.content) > ADMIN_TTS_MAX_CHARACTERS:
+            raise ValueError(
+                f"Audio messages must be {ADMIN_TTS_MAX_CHARACTERS} characters or fewer"
+            )
+        if has_audio and self.voice_style is None:
+            self.voice_style = "conversational"
+        if has_voice_preview and not has_audio:
+            raise ValueError("A voice preview can be used only for an audio message")
+        if not has_audio and self.voice_style is not None:
+            raise ValueError("A voice style can be selected only for an audio message")
         if self.image_filename:
             self.image_filename = Path(self.image_filename).name.strip()[:180]
             if not self.image_filename:
                 raise ValueError("The image filename is invalid")
+        if self.recording_filename:
+            self.recording_filename = Path(self.recording_filename).name.strip()[:180]
+            if not self.recording_filename:
+                raise ValueError("The recording filename is invalid")
+        if self.voice_preview_filename:
+            self.voice_preview_filename = Path(self.voice_preview_filename).name.strip()[:180]
+            if not self.voice_preview_filename:
+                raise ValueError("The voice preview filename is invalid")
+        return self
+
+
+class AdminVoiceTranscriptionRequest(BaseModel):
+    audio_base64: str = Field(min_length=1, max_length=21_000_000)
+    audio_mime_type: Literal["audio/wav"] = "audio/wav"
+    audio_filename: str = Field(default="admin-voice-draft.wav", max_length=180)
+
+    @field_validator("audio_filename")
+    @classmethod
+    def normalize_filename(cls, value: str) -> str:
+        cleaned = Path(value).name.strip()[:180]
+        if not cleaned:
+            raise ValueError("The recording filename is invalid")
+        return cleaned
+
+
+class AdminVoiceTranscriptionResponse(BaseModel):
+    transcript: str
+    duration_seconds: float
+
+
+class AdminVoicePreviewRequest(BaseModel):
+    content: str = Field(default="", max_length=ADMIN_TTS_MAX_CHARACTERS)
+    voice_style: Literal["conversational", "seductive"] = "conversational"
+    draft_source: Literal["text", "recording"] = "text"
+    recording_base64: str | None = Field(default=None, max_length=21_000_000)
+    recording_mime_type: Literal["audio/wav"] | None = None
+    recording_filename: str | None = Field(default=None, max_length=180)
+
+    @model_validator(mode="after")
+    def validate_voice_preview(self) -> "AdminVoicePreviewRequest":
+        self.content = self.content.strip()
+        has_recording = bool(self.recording_base64)
+        if has_recording and (
+            self.recording_mime_type != "audio/wav" or not self.recording_filename
+        ):
+            raise ValueError("A recording needs a filename and WAV file type")
+        if not has_recording and (
+            self.recording_mime_type or self.recording_filename
+        ):
+            raise ValueError("Recording details were provided without audio data")
+        if self.draft_source == "text" and has_recording:
+            raise ValueError("Choose Record before attaching a voice draft")
+        if self.draft_source == "recording" and self.content and has_recording:
+            raise ValueError("Preview either a recording or its reviewed transcript")
+        if not self.content and not has_recording:
+            raise ValueError("Write or record the words to use for the voice note")
+        if self.recording_filename:
+            self.recording_filename = Path(self.recording_filename).name.strip()[:180]
+            if not self.recording_filename:
+                raise ValueError("The recording filename is invalid")
+        return self
+
+
+class AdminVoicePreviewResponse(BaseModel):
+    transcript: str
+    audio_base64: str
+    audio_mime_type: Literal["audio/wav"] = "audio/wav"
+    audio_filename: str
+    duration_seconds: float
+    voice_style: Literal["conversational", "seductive"]
+
+
+class AdminSessionCreate(BaseModel):
+    user_id: int = Field(gt=0)
+    mode: Literal["listener", "partner"]
+    opening_message: str = Field(min_length=1, max_length=8_000)
+    scenario: str | None = Field(default=None, max_length=80)
+    persona: str | None = Field(default=None, max_length=80)
+    roleplay_intensity: Literal["romantic", "direct", "explicit"] | None = None
+    roleplay_difficulty: Literal["supportive", "realistic", "resistant"] | None = None
+    character_description: str | None = Field(default=None, max_length=75_000)
+
+    @field_validator("opening_message")
+    @classmethod
+    def opening_message_cannot_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Opening message cannot be blank")
+        return cleaned
+
+    @field_validator("character_description")
+    @classmethod
+    def normalize_admin_character_description(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split())
+        if len(normalized.split()) > 5_000:
+            raise ValueError("Character description must be 5,000 words or fewer")
+        return normalized or None
+
+    @model_validator(mode="after")
+    def validate_admin_session_mode(self) -> "AdminSessionCreate":
+        if self.mode == "partner":
+            if not self.persona:
+                raise ValueError("Choose a character for a Partner conversation")
+            self.roleplay_intensity = self.roleplay_intensity or "explicit"
+            self.roleplay_difficulty = self.roleplay_difficulty or "realistic"
+        elif any(
+            value is not None
+            for value in (
+                self.scenario,
+                self.persona,
+                self.roleplay_intensity,
+                self.roleplay_difficulty,
+                self.character_description,
+            )
+        ):
+            raise ValueError("Character and roleplay settings are available only in Partner mode")
         return self
 
 
@@ -881,6 +1162,219 @@ def decode_user_voice_note(encoded: str) -> tuple[bytes, float]:
     return content, duration_seconds
 
 
+def transcribe_admin_recording(
+    audio_content: bytes,
+    filename: str,
+) -> str:
+    """Convert an administrator's temporary WAV draft into editable text."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Voice transcription is unavailable because GROQ_API_KEY is not configured.",
+        )
+    try:
+        response = requests.post(
+            GROQ_STT_API_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (Path(filename).name, audio_content, "audio/wav")},
+            data={
+                "model": GROQ_STT_MODEL,
+                "response_format": "json",
+                "temperature": "0",
+                "prompt": (
+                    "Transcribe exactly. Write spoken Urdu in Roman Urdu using Latin "
+                    "letters, and preserve spoken English words and punctuation."
+                ),
+            },
+            timeout=45,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The voice transcription provider could not be reached. Try again.",
+        ) from exc
+    if response.status_code >= 400:
+        logger.warning(
+            "Groq transcription request failed with status %s",
+            response.status_code,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The voice recording could not be transcribed. Try again.",
+        )
+    try:
+        transcript = " ".join(str(response.json().get("text") or "").split())
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The voice transcription provider returned an invalid response.",
+        ) from exc
+    if not transcript:
+        raise HTTPException(
+            status_code=422,
+            detail="No speech was detected. Record the message again.",
+        )
+    if len(transcript) > ADMIN_TTS_MAX_CHARACTERS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"The recording transcribed to more than {ADMIN_TTS_MAX_CHARACTERS} "
+                "characters. Record a shorter message."
+            ),
+        )
+    return transcript
+
+
+def decode_admin_voice_draft(encoded: str) -> tuple[bytes, float]:
+    """Validate a temporary administrator recording before transcription."""
+    audio_content, duration_seconds = decode_user_voice_note(encoded)
+    if duration_seconds > ADMIN_VOICE_DRAFT_MAX_SECONDS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Recorded drafts must be {ADMIN_VOICE_DRAFT_MAX_SECONDS} seconds "
+                "or shorter."
+            ),
+        )
+    return audio_content, duration_seconds
+
+
+def admin_tts_chunks(content: str) -> list[str]:
+    """Split one draft into short speech requests without changing its wording."""
+    remaining = " ".join(content.split())
+    chunks: list[str] = []
+    while len(remaining) > ADMIN_TTS_CHUNK_CHARACTERS:
+        split_at = max(
+            remaining.rfind(". ", 0, ADMIN_TTS_CHUNK_CHARACTERS),
+            remaining.rfind("? ", 0, ADMIN_TTS_CHUNK_CHARACTERS),
+            remaining.rfind("! ", 0, ADMIN_TTS_CHUNK_CHARACTERS),
+        )
+        if split_at >= ADMIN_TTS_CHUNK_CHARACTERS // 2:
+            split_at += 1
+        else:
+            split_at = remaining.rfind(" ", 0, ADMIN_TTS_CHUNK_CHARACTERS)
+        if split_at < ADMIN_TTS_CHUNK_CHARACTERS // 2:
+            split_at = ADMIN_TTS_CHUNK_CHARACTERS
+        chunks.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def merge_admin_tts_wav(chunks: list[bytes]) -> tuple[bytes, float]:
+    """Validate and join generated WAV chunks into one playable voice note."""
+    if not chunks:
+        raise HTTPException(status_code=502, detail="The voice provider returned no audio.")
+    output = BytesIO()
+    expected_format: tuple[int, int, int, str] | None = None
+    frames: list[bytes] = []
+    for content in chunks:
+        try:
+            with wave.open(BytesIO(content), "rb") as recording:
+                current_format = (
+                    recording.getnchannels(),
+                    recording.getsampwidth(),
+                    recording.getframerate(),
+                    recording.getcomptype(),
+                )
+                if expected_format is None:
+                    expected_format = current_format
+                elif current_format != expected_format:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The voice provider returned incompatible audio chunks.",
+                    )
+                frame_count = recording.getnframes()
+                frame_data = recording.readframes(frame_count)
+                if len(frame_data) != frame_count * recording.getnchannels() * recording.getsampwidth():
+                    raise HTTPException(status_code=502, detail="The voice provider returned an incomplete audio file.")
+                frames.append(frame_data)
+        except (EOFError, wave.Error) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="The voice provider returned an invalid audio file.",
+            ) from exc
+    if expected_format is None:
+        raise HTTPException(status_code=502, detail="The voice provider returned no valid audio.")
+    with wave.open(output, "wb") as combined:
+        combined.setnchannels(expected_format[0])
+        combined.setsampwidth(expected_format[1])
+        combined.setframerate(expected_format[2])
+        combined.setcomptype(expected_format[3], "not compressed")
+        for frame_data in frames:
+            combined.writeframes(frame_data)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return decode_user_voice_note(encoded)
+
+
+def generate_admin_speech(
+    content: str,
+    voice_style: Literal["conversational", "seductive"],
+) -> tuple[bytes, float]:
+    """Generate a WAV voice note with the existing Groq account."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Audio generation is unavailable because GROQ_API_KEY is not configured.",
+        )
+    voice = (
+        GROQ_TTS_SEDUCTIVE_VOICE
+        if voice_style == "seductive"
+        else GROQ_TTS_NATURAL_VOICE
+    )
+    audio_chunks: list[bytes] = []
+    for chunk in admin_tts_chunks(content):
+        spoken_input = f"[breathy] {chunk}" if voice_style == "seductive" else chunk
+        try:
+            response = requests.post(
+                GROQ_TTS_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_TTS_MODEL,
+                    "voice": voice,
+                    "input": spoken_input,
+                    "response_format": "wav",
+                },
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="The voice provider could not be reached. Try again.",
+            ) from exc
+        if response.status_code >= 400:
+            error_code = ""
+            try:
+                error_code = str(response.json().get("error", {}).get("code") or "")
+            except (AttributeError, ValueError):
+                error_code = ""
+            logger.warning(
+                "Groq speech request failed with status %s and code %s",
+                response.status_code,
+                error_code or "unknown",
+            )
+            if error_code == "model_terms_required":
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "The Groq organization owner must accept the Orpheus speech "
+                        "model terms before generated audio can be used."
+                    ),
+                )
+            raise HTTPException(
+                status_code=502,
+                detail="The voice provider could not create this audio. Try again.",
+            )
+        audio_chunks.append(response.content)
+    return merge_admin_tts_wav(audio_chunks)
+
+
 def stored_attachment_response(attachment: sqlite3.Row) -> Response:
     filename = re.sub(r"[^A-Za-z0-9._ -]", "_", str(attachment["filename"]))[:180]
     return Response(
@@ -924,6 +1418,10 @@ def initialize_database() -> None:
                 email_notifications_enabled_at TEXT,
                 terms_version TEXT,
                 experience_version INTEGER NOT NULL DEFAULT 1,
+                access_status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(access_status IN ('pending', 'active')),
+                preferred_time_slot TEXT NOT NULL DEFAULT 'flexible',
+                access_approved_at TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -963,6 +1461,12 @@ def initialize_database() -> None:
                 viewed_at TEXT NOT NULL,
                 FOREIGN KEY(visitor_session_id) REFERENCES visitor_sessions(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS ip_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL UNIQUE,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS consents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -986,6 +1490,12 @@ def initialize_database() -> None:
                 roleplay_difficulty TEXT,
                 character_description TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_owners (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS message_attachments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1129,6 +1639,11 @@ def initialize_database() -> None:
                 read_at TEXT NOT NULL,
                 FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS admin_message_reads (
+                message_id INTEGER PRIMARY KEY,
+                read_at TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS email_notification_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1310,6 +1825,11 @@ def initialize_database() -> None:
                 name TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 action TEXT NOT NULL,
@@ -1341,6 +1861,7 @@ def initialize_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_visitors_hash_seen ON visitor_sessions(visitor_hash, last_seen);
             CREATE INDEX IF NOT EXISTS idx_visitors_last_seen ON visitor_sessions(last_seen);
             CREATE INDEX IF NOT EXISTS idx_visitor_pageviews_session ON visitor_pageviews(visitor_session_id, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ip_blocks_address ON ip_blocks(ip_address);
             CREATE INDEX IF NOT EXISTS idx_email_notification_status ON email_notification_deliveries(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_web_push_user ON web_push_subscriptions(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_push_notification_status ON push_notification_deliveries(status, updated_at);
@@ -1354,11 +1875,58 @@ def initialize_database() -> None:
                 ON telegram_reply_drafts(session_id, status);
             CREATE INDEX IF NOT EXISTS idx_admin_message_revisions_session
                 ON admin_message_revisions(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_admin_message_reads_time
+                ON admin_message_reads(read_at);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_topic_thread
                 ON telegram_session_topics(chat_id, message_thread_id);
             """
         )
         add_column_if_missing(connection, "messages", "user_id INTEGER")
+        conflicting_sessions = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM (
+                       SELECT session_id FROM messages
+                       WHERE user_id IS NOT NULL
+                       GROUP BY session_id
+                       HAVING COUNT(DISTINCT user_id) > 1
+                   )"""
+            ).fetchone()[0]
+        )
+        if conflicting_sessions:
+            raise RuntimeError(
+                "Conversation ownership cannot be enforced because an existing "
+                "session ID belongs to more than one account."
+            )
+        connection.execute(
+            """INSERT OR IGNORE INTO session_owners (session_id, user_id, created_at)
+               SELECT session_id, MIN(user_id), MIN(created_at)
+               FROM messages
+               WHERE user_id IS NOT NULL
+               GROUP BY session_id"""
+        )
+        connection.execute(
+            """CREATE TRIGGER IF NOT EXISTS enforce_message_session_owner
+               BEFORE INSERT ON messages
+               WHEN NEW.user_id IS NOT NULL
+               BEGIN
+                   INSERT OR IGNORE INTO session_owners
+                       (session_id, user_id, created_at)
+                   VALUES (NEW.session_id, NEW.user_id, NEW.created_at);
+                   SELECT CASE
+                       WHEN (SELECT user_id FROM session_owners
+                             WHERE session_id = NEW.session_id) != NEW.user_id
+                       THEN RAISE(ABORT, 'conversation session belongs to another account')
+                   END;
+               END"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_session "
+            "ON messages(user_id, session_id, id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_role_user_session "
+            "ON messages(role, user_id, session_id, id)"
+        )
         add_column_if_missing(connection, "messages", "prompt_tokens INTEGER NOT NULL DEFAULT 0")
         add_column_if_missing(connection, "messages", "completion_tokens INTEGER NOT NULL DEFAULT 0")
         add_column_if_missing(connection, "messages", "model TEXT")
@@ -1446,9 +2014,25 @@ def initialize_database() -> None:
             "users",
             f"experience_version INTEGER NOT NULL DEFAULT {LEGACY_EXPERIENCE_VERSION}",
         )
+        add_column_if_missing(
+            connection,
+            "users",
+            "access_status TEXT NOT NULL DEFAULT 'active' CHECK(access_status IN ('pending', 'active'))",
+        )
+        add_column_if_missing(
+            connection,
+            "users",
+            "preferred_time_slot TEXT NOT NULL DEFAULT 'flexible'",
+        )
+        add_column_if_missing(connection, "users", "access_approved_at TEXT")
         add_column_if_missing(connection, "admin_notes", "user_id INTEGER")
         add_column_if_missing(connection, "corrections", "user_id INTEGER")
         add_column_if_missing(connection, "consents", "admin_intervention_consent INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            """INSERT OR IGNORE INTO app_settings (key, value, updated_at)
+               VALUES (?, '1', ?)""",
+            (NEW_ACCOUNT_APPROVAL_SETTING, utc_now()),
+        )
 
         email_default_migration = "enable_email_notifications_for_existing_users_v1"
         if not connection.execute(
@@ -1481,6 +2065,22 @@ def initialize_database() -> None:
             connection.execute(
                 "INSERT INTO app_migrations (name, applied_at) VALUES (?, ?)",
                 (unread_backfill_migration, backfilled_at),
+            )
+
+        admin_inbox_migration = "initialize_admin_message_reads_v1"
+        if not connection.execute(
+            "SELECT 1 FROM app_migrations WHERE name = ?",
+            (admin_inbox_migration,),
+        ).fetchone():
+            initialized_at = utc_now()
+            connection.execute(
+                """INSERT OR IGNORE INTO admin_message_reads (message_id, read_at)
+                   SELECT id, ? FROM messages WHERE role = 'user'""",
+                (initialized_at,),
+            )
+            connection.execute(
+                "INSERT INTO app_migrations (name, applied_at) VALUES (?, ?)",
+                (admin_inbox_migration, initialized_at),
             )
 
         if not connection.execute(
@@ -1533,6 +2133,85 @@ def token_digest(token: str) -> str:
 def visitor_digest(browser_id: str) -> str:
     """Keep the browser identifier out of visitor analytics storage."""
     return hashlib.sha256(f"dilse-visitor:{browser_id}".encode("utf-8")).hexdigest()
+
+
+def canonical_ip_address(raw_address: str | None) -> str | None:
+    """Return one stable representation for exact IPv4 and IPv6 matching."""
+    if not raw_address:
+        return None
+    try:
+        address = ipaddress.ip_address(raw_address.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped.compressed
+    return address.compressed
+
+
+_RATE_LIMIT_LOCK = Lock()
+_RATE_LIMIT_BUCKETS: dict[tuple[str, str], deque[float]] = {}
+
+
+def request_source_key(request: Request) -> str:
+    """Return a privacy-preserving source key from a trusted internal caller."""
+    internal_secret = os.getenv("VISITOR_TRACKING_SECRET", "").strip()
+    supplied_secret = request.headers.get("x-dilse-internal-key", "")
+    if (
+        internal_secret
+        and supplied_secret
+        and secrets.compare_digest(supplied_secret, internal_secret)
+    ):
+        fingerprint = request.headers.get("x-dilse-client-fingerprint", "").lower()
+        if re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+            return f"client:{fingerprint}"
+        forwarded_ip = canonical_ip_address(request.headers.get("x-real-ip"))
+        if forwarded_ip:
+            return f"ip:{token_digest(forwarded_ip)}"
+    peer = request.client.host if request.client else "unknown"
+    return f"peer:{token_digest(str(peer))}"
+
+
+def enforce_rate_limit(
+    bucket: str,
+    key: str,
+    *,
+    limit: int,
+    window_seconds: int = AUTH_RATE_LIMIT_WINDOW_SECONDS,
+    record: bool = True,
+) -> None:
+    """Apply a bounded in-process sliding window without retaining raw identifiers."""
+    now = time.monotonic()
+    bucket_key = (bucket, token_digest(key))
+    cutoff = now - window_seconds
+    with _RATE_LIMIT_LOCK:
+        attempts = _RATE_LIMIT_BUCKETS.setdefault(bucket_key, deque())
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
+        if len(attempts) >= limit:
+            retry_after = max(1, int(window_seconds - (now - attempts[0])))
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        if record:
+            attempts.append(now)
+
+
+def clear_rate_limit(bucket: str, key: str) -> None:
+    with _RATE_LIMIT_LOCK:
+        _RATE_LIMIT_BUCKETS.pop((bucket, token_digest(key)), None)
+
+
+def ip_is_blocked(connection: sqlite3.Connection, raw_address: str | None) -> bool:
+    normalized = canonical_ip_address(raw_address)
+    if not normalized:
+        return False
+    row = connection.execute(
+        "SELECT 1 FROM ip_blocks WHERE ip_address = ?",
+        (normalized,),
+    ).fetchone()
+    return row is not None
 
 
 def mask_visitor_ip(raw_address: str | None) -> str:
@@ -1592,6 +2271,14 @@ def user_view(row: sqlite3.Row) -> UserView:
             if "experience_version" in row.keys()
             else LEGACY_EXPERIENCE_VERSION
         ),
+        access_status=str(
+            row["access_status"] if "access_status" in row.keys() else "active"
+        ),
+        preferred_time_slot=str(
+            row["preferred_time_slot"]
+            if "preferred_time_slot" in row.keys()
+            else "flexible"
+        ),
         created_at=row["created_at"],
     )
 
@@ -1621,6 +2308,11 @@ def require_user(x_user_token: Annotated[str | None, Header()] = None) -> sqlite
 
 
 def require_current_terms(user: sqlite3.Row = Depends(require_user)) -> sqlite3.Row:
+    if user["access_status"] != "active":
+        raise HTTPException(
+            status_code=403,
+            detail="Your account is on the DilSe waitlist.",
+        )
     if user["terms_version"] != CONSENT_VERSION:
         raise HTTPException(
             status_code=428,
@@ -1674,6 +2366,48 @@ def audit(connection: sqlite3.Connection, action: str, target: str) -> None:
         "INSERT INTO audit_log (action, target, created_at) VALUES (?, ?, ?)",
         (action, target, utc_now()),
     )
+
+
+def app_setting(
+    connection: sqlite3.Connection,
+    key: str,
+    default: str | None = None,
+) -> str | None:
+    row = connection.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (key,)
+    ).fetchone()
+    return str(row["value"]) if row else default
+
+
+def set_app_setting(connection: sqlite3.Connection, key: str, value: str) -> None:
+    connection.execute(
+        """INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+        (key, value, utc_now()),
+    )
+
+
+def new_account_approval_required(connection: sqlite3.Connection) -> bool:
+    return app_setting(connection, NEW_ACCOUNT_APPROVAL_SETTING, "1") != "0"
+
+
+def claim_session_owner(
+    connection: sqlite3.Connection,
+    session_id: str,
+    user_id: int,
+) -> None:
+    """Bind a client-generated conversation ID to exactly one user account."""
+    connection.execute(
+        """INSERT OR IGNORE INTO session_owners (session_id, user_id, created_at)
+           VALUES (?, ?, ?)""",
+        (session_id, user_id, utc_now()),
+    )
+    owner = connection.execute(
+        "SELECT user_id FROM session_owners WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if not owner or int(owner["user_id"]) != user_id:
+        raise HTTPException(status_code=409, detail="Create a new conversation and try again.")
 
 
 def active_prompt(connection: sqlite3.Connection) -> str:
@@ -3131,6 +3865,122 @@ def send_unread_notification_email(recipient: str, display_name: str) -> str:
                     <p style="font-size:16px;line-height:1.6;margin:0 0 22px">You have an unread response in one of your DilSe conversations.</p>
                     <a href="{escape(app_url)}" style="display:inline-block;background:#70213f;color:#ffffff;text-decoration:none;padding:13px 20px;border-radius:999px;font-weight:700">Open conversation</a>
                     <p style="font-size:13px;line-height:1.55;color:#7b6870;margin:24px 0 0">For privacy, this email does not include any conversation details. You can turn these emails off from your DilSe account settings.</p>
+                  </div>
+                </div>
+            """,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return str(payload.get("id") or "sent")
+
+
+def send_account_deletion_confirmation_email(
+    recipient: str,
+    display_name: str,
+    departure_reason: str,
+    deleted_at: str,
+    confirmation_reference: str,
+) -> str:
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    sender = os.getenv("EMAIL_FROM", "").strip()
+    if not api_key or not sender:
+        raise RuntimeError("Email delivery is not configured.")
+
+    name = display_name.strip().split()[0] if display_name.strip() else "there"
+    safe_name = escape(name)
+    safe_reason = escape(departure_reason)
+    safe_deleted_at = escape(deleted_at)
+    safe_reference = escape(confirmation_reference)
+    response = requests.post(
+        RESEND_API_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "from": sender,
+            "to": [recipient],
+            "subject": "Your DilSe account has been deleted",
+            "text": (
+                f"Hi {name},\n\n"
+                "Your DilSe account has been deleted from the live DilSe service.\n\n"
+                "Your profile, "
+                "stored conversations, voice notes, consent records, feedback, and active "
+                "sign-in sessions were removed. You can no longer sign in using this deleted account.\n\n"
+                f"Reason for leaving: {departure_reason}\n"
+                f"Deletion completed: {deleted_at}\n"
+                f"Confirmation reference: {confirmation_reference}\n\n"
+                "This confirms that your account, conversations, and personal data were "
+                "removed from the live DilSe service.\n\n"
+                "Regards,\n\n"
+                "Baat Dilse Team."
+            ),
+            "html": f"""
+                <div style="background:#fcfaf7;padding:32px 18px;font-family:Arial,sans-serif;color:#30242a">
+                  <div style="max-width:540px;margin:0 auto;border-top:4px solid #6c2945;padding:28px 4px">
+                    <div style="font-size:13px;font-weight:700;color:#6c2945;letter-spacing:.08em">DILSE</div>
+                    <h1 style="font-family:Georgia,serif;font-size:27px;line-height:1.25;margin:16px 0 12px">Your account has been deleted</h1>
+                    <p style="font-size:16px;line-height:1.65;margin:0 0 12px">Hi {safe_name},</p>
+                    <p style="font-size:16px;line-height:1.65;margin:0 0 20px">Your DilSe account has been deleted from the live DilSe service.</p>
+                    <p style="font-size:16px;line-height:1.65;margin:0 0 20px">Your profile, stored conversations, voice notes, consent records, feedback, and active sign-in sessions were removed. You can no longer sign in using this deleted account.</p>
+                    <div style="border-left:3px solid #245e58;background:#eef4f2;padding:14px 16px;margin:0 0 20px">
+                      <div style="font-size:13px;line-height:1.6"><strong>Reason for leaving:</strong> {safe_reason}</div>
+                      <div style="font-size:13px;line-height:1.6"><strong>Deletion completed:</strong> {safe_deleted_at}</div>
+                      <div style="font-size:13px;line-height:1.6"><strong>Confirmation reference:</strong> {safe_reference}</div>
+                    </div>
+                    <p style="font-size:14px;line-height:1.6;color:#556d68;margin:0 0 20px">This confirms that your account, conversations, and personal data were removed from the live DilSe service.</p>
+                    <p style="font-size:14px;line-height:1.6;margin:0">Regards,<br><br>Baat Dilse Team.</p>
+                  </div>
+                </div>
+            """,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return str(payload.get("id") or "sent")
+
+
+def send_account_activation_email(
+    recipient: str,
+    display_name: str,
+    preferred_time_slot: str,
+) -> str:
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    sender = os.getenv("EMAIL_FROM", "").strip()
+    app_url = os.getenv("PUBLIC_APP_URL", "https://www.baatdilse.com/app/").strip()
+    if not api_key or not sender:
+        raise RuntimeError("Email delivery is not configured.")
+
+    name = display_name.strip() or "there"
+    slot_label = PREFERRED_TIME_SLOT_LABELS.get(
+        preferred_time_slot,
+        PREFERRED_TIME_SLOT_LABELS["flexible"],
+    )
+    response = requests.post(
+        RESEND_API_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "from": sender,
+            "to": [recipient],
+            "subject": "Your DilSe account is active",
+            "text": (
+                f"Hi {name},\n\n"
+                "Your DilSe account is now active. You can sign in and start a conversation.\n\n"
+                f"Preferred time: {slot_label}\n"
+                f"Open DilSe: {app_url}\n\n"
+                "Regards,\n\n"
+                "Baat Dilse Team."
+            ),
+            "html": f"""
+                <div style="background:#fbf4ec;padding:32px 18px;font-family:Arial,sans-serif;color:#30242a">
+                  <div style="max-width:540px;margin:0 auto;border-top:4px solid #571f35;padding:28px 4px">
+                    <div style="font-size:13px;font-weight:700;color:#571f35;letter-spacing:.08em">DILSE</div>
+                    <h1 style="font-family:Georgia,serif;font-size:27px;line-height:1.25;margin:16px 0 12px">Your account is active</h1>
+                    <p style="font-size:16px;line-height:1.65;margin:0 0 12px">Hi {escape(name)},</p>
+                    <p style="font-size:16px;line-height:1.65;margin:0 0 20px">Your DilSe account is now active. You can sign in and start a conversation.</p>
+                    <div style="border-left:3px solid #245e58;background:#eef4f2;padding:14px 16px;margin:0 0 22px;font-size:14px;line-height:1.6"><strong>Preferred time:</strong> {escape(slot_label)}</div>
+                    <a href="{escape(app_url)}" style="display:inline-block;background:#571f35;color:#ffffff;text-decoration:none;padding:13px 20px;border-radius:999px;font-weight:700">Open DilSe</a>
+                    <p style="font-size:14px;line-height:1.6;margin:24px 0 0">Regards,<br><br>Baat Dilse Team.</p>
                   </div>
                 </div>
             """,
@@ -5040,6 +5890,15 @@ def mobile_version() -> dict[str, object]:
     }
 
 
+@app.post("/visitor/access-check", dependencies=[Depends(require_visitor_tracking_key)])
+def visitor_access_check(
+    request: VisitorIPAccessCheckRequest,
+) -> dict[str, bool]:
+    with closing(get_connection()) as connection:
+        blocked = ip_is_blocked(connection, request.ip_address)
+    return {"blocked": blocked}
+
+
 @app.post("/visitor/heartbeat", dependencies=[Depends(require_visitor_tracking_key)])
 def visitor_heartbeat(
     request: VisitorHeartbeatRequest,
@@ -5052,6 +5911,8 @@ def visitor_heartbeat(
     masked_ip = mask_visitor_ip(request.ip_address)
     digest = visitor_digest(request.browser_id)
     with closing(get_connection()) as connection:
+        if ip_is_blocked(connection, request.ip_address):
+            raise HTTPException(status_code=403, detail="Access denied.")
         prune_visitor_history(connection)
         user_id = visitor_user_id(connection, x_user_token)
         current = connection.execute(
@@ -5100,17 +5961,22 @@ def register(request: RegisterRequest) -> AuthResponse:
         raise HTTPException(status_code=400, detail="Accept the Terms and Conditions to create an account.")
     password_hash, salt = hash_password(request.password)
     with closing(get_connection()) as connection:
+        approval_required = new_account_approval_required(connection)
+        access_status = "pending" if approval_required else "active"
+        approved_at = None if approval_required else utc_now()
         try:
             cursor = connection.execute(
                 """INSERT INTO users
                    (email, password_hash, password_salt, display_name, language, country,
                     retention_days, store_chats, allow_admin_review, allow_admin_intervention,
                     email_notifications_enabled, email_notifications_enabled_at,
-                    terms_version, experience_version, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)""",
+                    terms_version, experience_version, access_status,
+                    preferred_time_slot, access_approved_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)""",
                 (request.email.lower(), password_hash, salt, request.display_name, request.language,
                  request.country, 30, 1, 1, 1, utc_now(), CONSENT_VERSION,
-                 CURRENT_EXPERIENCE_VERSION, utc_now()),
+                 CURRENT_EXPERIENCE_VERSION, access_status,
+                 request.preferred_time_slot, approved_at, utc_now()),
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="An account already exists for this email.") from exc
@@ -5538,10 +6404,30 @@ def remove_mobile_push_device(
     return {"enabled": False}
 
 
-@app.delete("/account", status_code=204, response_class=Response)
-def delete_account(request: DeleteAccountRequest, user: sqlite3.Row = Depends(require_user)) -> Response:
+@app.delete("/account", response_model=AccountDeletionResponse)
+def delete_account(
+    request: DeleteAccountRequest,
+    http_request: Request,
+    user: sqlite3.Row = Depends(require_user),
+) -> AccountDeletionResponse | Response:
     if not verify_password(request.password, user["password_hash"], user["password_salt"]):
+        enforce_rate_limit(
+            "account-deletion-password",
+            f"{user['id']}:{request_source_key(http_request)}",
+            limit=8,
+            window_seconds=60 * 60,
+        )
         raise HTTPException(status_code=401, detail="Password is incorrect.")
+    recipient = str(user["email"])
+    display_name = str(user["display_name"])
+    departure_reason = ACCOUNT_DELETION_REASON_LABELS[
+        request.departure_reason or "prefer_not_to_say"
+    ]
+    deleted_at = utc_now()
+    confirmation_reference = (
+        f"DIL-{datetime.now(timezone.utc).strftime('%Y%m%d')}-"
+        f"{secrets.token_hex(3).upper()}"
+    )
     with closing(get_connection()) as connection:
         queue_telegram_topic_cleanup(connection, user_id=user["id"])
         connection.execute("DELETE FROM admin_notes WHERE user_id = ?", (user["id"],))
@@ -5560,7 +6446,30 @@ def delete_account(request: DeleteAccountRequest, user: sqlite3.Row = Depends(re
         connection.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user["id"],))
         connection.execute("DELETE FROM users WHERE id = ?", (user["id"],))
         connection.commit()
-    return Response(status_code=204)
+    email_sent = False
+    try:
+        send_account_deletion_confirmation_email(
+            recipient,
+            display_name,
+            departure_reason,
+            deleted_at,
+            confirmation_reference,
+        )
+        email_sent = True
+    except Exception as exc:
+        logger.warning(
+            "Account deletion completed, but its confirmation email failed: %s",
+            type(exc).__name__,
+        )
+    receipt = AccountDeletionResponse(
+        deleted_at=deleted_at,
+        confirmation_reference=confirmation_reference,
+        email_sent=email_sent,
+        departure_reason=departure_reason,
+    )
+    if request.departure_reason is None:
+        return Response(status_code=204)
+    return receipt
 
 
 @app.get("/catalog")
@@ -5606,6 +6515,7 @@ def create_user_voice_note(
         # Serialize creation so repeated browser submissions resolve to the first
         # stored message before another request can insert the same upload.
         connection.execute("BEGIN IMMEDIATE")
+        claim_session_owner(connection, session_id, int(user["id"]))
         prune_expired_messages(connection, user["id"], user["retention_days"])
         existing_voice_note = connection.execute(
             """SELECT voice_note.id AS voice_note_id, voice_note.message_id,
@@ -5733,6 +6643,7 @@ async def chat(request: ChatRequest, user: sqlite3.Row = Depends(require_current
         else LEGACY_EXPERIENCE_VERSION
     )
     with closing(get_connection()) as connection:
+        claim_session_owner(connection, request.session_id, int(user["id"]))
         prune_expired_messages(connection, user["id"], user["retention_days"])
         prompt = active_prompt(connection)
         scenario = catalog_item(connection, "scenarios", request.scenario)
@@ -6090,10 +7001,22 @@ def user_sessions(user: sqlite3.Row = Depends(require_current_terms)) -> list[di
         rows = connection.execute(
             """SELECT messages.session_id, MIN(messages.created_at) AS started_at,
                       MAX(messages.created_at) AS last_activity, COUNT(messages.id) AS message_count,
+                      (SELECT COUNT(*) FROM messages AS unread
+                       LEFT JOIN message_reads ON message_reads.message_id = unread.id
+                       WHERE unread.user_id = messages.user_id
+                         AND unread.session_id = messages.session_id
+                         AND unread.role = 'assistant'
+                         AND message_reads.message_id IS NULL
+                         AND NOT EXISTS (
+                             SELECT 1 FROM messages AS later_user
+                             WHERE later_user.user_id = unread.user_id
+                               AND later_user.session_id = unread.session_id
+                               AND later_user.role = 'user'
+                               AND later_user.id > unread.id
+                         )) AS unread_count,
                       (SELECT first_message.content FROM messages AS first_message
                        WHERE first_message.user_id = messages.user_id
                          AND first_message.session_id = messages.session_id
-                         AND first_message.role = 'user'
                        ORDER BY first_message.id ASC LIMIT 1) AS first_user_message,
                       (SELECT latest.mode FROM messages AS latest
                        WHERE latest.user_id = messages.user_id AND latest.session_id = messages.session_id
@@ -6121,13 +7044,66 @@ def user_sessions(user: sqlite3.Row = Depends(require_current_terms)) -> list[di
     return [dict(row) for row in rows]
 
 
-@app.get("/sessions/{session_id}/messages")
-def user_session_messages(
-    session_id: str, user: sqlite3.Row = Depends(require_current_terms)
-) -> list[dict[str, object]]:
+@app.get("/sessions/unread")
+def user_unread_sessions(
+    user: sqlite3.Row = Depends(require_current_terms),
+) -> dict[str, object]:
+    if not user["store_chats"] or user["retention_days"] <= 0:
+        return {"total_unread": 0, "conversations": []}
     with closing(get_connection()) as connection:
         rows = connection.execute(
-            """SELECT current.id, current.role, current.content, current.source,
+            """WITH unread AS (
+                   SELECT messages.id, messages.session_id, messages.content,
+                          messages.created_at
+                   FROM messages
+                   LEFT JOIN message_reads ON message_reads.message_id = messages.id
+                   WHERE messages.user_id = ?
+                     AND messages.role = 'assistant'
+                     AND message_reads.message_id IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM messages AS later_user
+                         WHERE later_user.user_id = messages.user_id
+                           AND later_user.session_id = messages.session_id
+                           AND later_user.role = 'user'
+                           AND later_user.id > messages.id
+                     )
+               )
+               SELECT unread.session_id, COUNT(*) AS unread_count,
+                      MAX(unread.created_at) AS last_activity,
+                      (SELECT latest.id FROM unread AS latest
+                       WHERE latest.session_id = unread.session_id
+                       ORDER BY latest.id DESC LIMIT 1) AS latest_message_id,
+                      (SELECT latest.content FROM unread AS latest
+                       WHERE latest.session_id = unread.session_id
+                       ORDER BY latest.id DESC LIMIT 1) AS latest_message_preview
+               FROM unread
+               GROUP BY unread.session_id
+               ORDER BY last_activity DESC""",
+            (user["id"],),
+        ).fetchall()
+    conversations = [dict(row) for row in rows]
+    return {
+        "total_unread": sum(int(row["unread_count"] or 0) for row in rows),
+        "conversations": conversations,
+    }
+
+
+@app.get("/sessions/{session_id}/messages")
+def user_session_messages(
+    session_id: str,
+    limit: int = Query(default=30, ge=20, le=200),
+    before_id: int | None = Query(default=None, ge=1),
+    user: sqlite3.Row = Depends(require_current_terms),
+) -> list[dict[str, object]]:
+    with closing(get_connection()) as connection:
+        cursor_clause = " AND current.id < ?" if before_id is not None else ""
+        query_parameters: tuple[object, ...] = (
+            (user["id"], session_id, before_id, limit)
+            if before_id is not None
+            else (user["id"], session_id, limit)
+        )
+        rows = connection.execute(
+            f"""SELECT current.id, current.role, current.content, current.source,
                       current.mode, current.scenario, current.character,
                       current.roleplay_intensity, current.roleplay_difficulty,
                       current.character_description, current.created_at,
@@ -6154,12 +7130,14 @@ def user_session_messages(
                LEFT JOIN message_voice_notes AS voice_note
                  ON voice_note.message_id = current.id
                WHERE current.user_id = ? AND current.session_id = ?
-               ORDER BY current.id""",
-            (user["id"], session_id),
+               {cursor_clause}
+               ORDER BY current.id DESC
+               LIMIT ?""",
+            query_parameters,
         ).fetchall()
-    if not rows:
+    if not rows and before_id is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
-    return [dict(row) for row in rows]
+    return [dict(row) for row in reversed(rows)]
 
 
 @app.get("/messages/{message_id}/attachment", response_class=Response)
@@ -6389,6 +7367,7 @@ def session_updates(
 def session_sync(
     session_id: str,
     after_id: int = Query(default=0, ge=0),
+    known_count: int | None = Query(default=None, ge=0),
     user: sqlite3.Row = Depends(require_current_terms),
 ) -> dict[str, object]:
     """Return the current control state and new replies in one lightweight request."""
@@ -6397,13 +7376,21 @@ def session_sync(
             "SELECT mode, updated_at FROM session_controls WHERE session_id = ? AND user_id = ?",
             (session_id, user["id"]),
         ).fetchone()
-        message_ids = [
-            int(row["id"])
-            for row in connection.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id",
+        message_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND user_id = ?",
                 (session_id, user["id"]),
-            )
-        ]
+            ).fetchone()[0]
+        )
+        message_ids = None
+        if known_count is None or known_count != message_count:
+            message_ids = [
+                int(row["id"])
+                for row in connection.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND user_id = ? ORDER BY id",
+                    (session_id, user["id"]),
+                )
+            ]
         updates = connection.execute(
             """SELECT current.id, current.role, current.content, current.source,
                       current.created_at, current.reply_to_message_id,
@@ -6436,9 +7423,38 @@ def session_sync(
     return {
         "mode": control["mode"] if control else "ai",
         "updated_at": control["updated_at"] if control else None,
+        "message_count": message_count,
         "message_ids": message_ids,
         "updates": [dict(row) for row in updates],
     }
+
+
+def user_session_live_revision(session_id: str, user_id: int) -> str:
+    with closing(get_connection()) as connection:
+        snapshot = connection.execute(
+            """SELECT COUNT(*) AS message_count, MAX(id) AS latest_message_id
+               FROM messages WHERE session_id = ? AND user_id = ?""",
+            (session_id, user_id),
+        ).fetchone()
+    return f"{int(snapshot['message_count'] or 0)}:{int(snapshot['latest_message_id'] or 0)}"
+
+
+@app.get("/sessions/{session_id}/live")
+async def wait_for_user_session_change(
+    session_id: str,
+    revision: str = Query(default=""),
+    timeout_seconds: int = Query(default=25, ge=1, le=30),
+    user: sqlite3.Row = Depends(require_current_terms),
+) -> dict[str, object]:
+    """Wait until a stored message is added or removed, without returning the transcript."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        current_revision = user_session_live_revision(session_id, int(user["id"]))
+        if current_revision != revision:
+            return {"changed": True, "revision": current_revision}
+        if time.monotonic() >= deadline:
+            return {"changed": False, "revision": current_revision}
+        await asyncio.sleep(0.25)
 
 
 @app.post("/sessions/{session_id}/typing")
@@ -6581,6 +7597,102 @@ def eligible_intervention_session(connection: sqlite3.Connection, session_id: st
     return row if row and row["allow_admin_intervention"] else None
 
 
+def current_typing_presence(typing_presence: sqlite3.Row | None) -> bool:
+    if not typing_presence or not typing_presence["is_typing"]:
+        return False
+    try:
+        typing_updated_at = datetime.fromisoformat(
+            str(typing_presence["updated_at"]).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    return (
+        datetime.now(timezone.utc) - typing_updated_at.astimezone(timezone.utc)
+    ) <= timedelta(seconds=8)
+
+
+@app.get("/admin/access-settings", dependencies=[Depends(require_admin_key)])
+def admin_access_settings() -> dict[str, bool]:
+    with closing(get_connection()) as connection:
+        required = new_account_approval_required(connection)
+    return {"require_approval_for_new_accounts": required}
+
+
+@app.put("/admin/access-settings", dependencies=[Depends(require_admin_key)])
+def update_admin_access_settings(
+    request: AdminAccessSettingsUpdate,
+) -> dict[str, bool]:
+    with closing(get_connection()) as connection:
+        set_app_setting(
+            connection,
+            NEW_ACCOUNT_APPROVAL_SETTING,
+            "1" if request.require_approval_for_new_accounts else "0",
+        )
+        audit(
+            connection,
+            "update_new_account_approval",
+            "required" if request.require_approval_for_new_accounts else "not_required",
+        )
+        connection.commit()
+    return {
+        "require_approval_for_new_accounts": request.require_approval_for_new_accounts
+    }
+
+
+@app.post("/admin/users/{user_id}/approve", dependencies=[Depends(require_admin_key)])
+def approve_admin_user(
+    user_id: int,
+    request: AdminUserApprovalRequest,
+) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        user = connection.execute(
+            """SELECT id, email, display_name, access_status, preferred_time_slot,
+                      access_approved_at
+               FROM users WHERE id = ?""",
+            (user_id,),
+        ).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        newly_activated = user["access_status"] != "active"
+        approved_at = str(user["access_approved_at"] or utc_now())
+        human_default = 1 if request.default_response_mode == "human" else 0
+        connection.execute(
+            """UPDATE users
+               SET access_status = 'active', access_approved_at = ?,
+                   default_human_control = ?
+               WHERE id = ?""",
+            (approved_at, human_default, user_id),
+        )
+        audit(
+            connection,
+            "approve_user_access",
+            f"user:{user_id}:mode:{request.default_response_mode}",
+        )
+        connection.commit()
+
+    email_sent = False
+    email_error: str | None = None
+    if newly_activated:
+        try:
+            send_account_activation_email(
+                str(user["email"]),
+                str(user["display_name"]),
+                str(user["preferred_time_slot"]),
+            )
+            email_sent = True
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            logger.warning("Account activation email could not be sent: %s", exc)
+            email_error = "The account was activated, but the email could not be delivered."
+    return {
+        "status": "active",
+        "default_response_mode": request.default_response_mode,
+        "approved_at": approved_at,
+        "email_sent": email_sent,
+        "email_error": email_error,
+        "already_active": not newly_activated,
+    }
+
+
 @app.get("/admin/users", dependencies=[Depends(require_admin_key)])
 def admin_users() -> list[dict[str, object]]:
     with closing(get_connection()) as connection:
@@ -6588,7 +7700,8 @@ def admin_users() -> list[dict[str, object]]:
             """SELECT users.id, users.email, users.display_name, users.language, users.country,
                       users.retention_days, users.store_chats, users.allow_admin_review,
                       users.allow_admin_intervention, users.default_human_control,
-                      users.terms_version, users.created_at,
+                      users.terms_version, users.access_status,
+                      users.preferred_time_slot, users.access_approved_at, users.created_at,
                       CASE WHEN users.allow_admin_review = 1
                            THEN COUNT(DISTINCT messages.session_id) ELSE 0 END AS reviewable_sessions,
                       CASE WHEN users.allow_admin_review = 1
@@ -6607,13 +7720,73 @@ def admin_users() -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
+@app.get("/admin/inbox", dependencies=[Depends(require_admin_key)])
+def admin_unread_inbox(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, object]:
+    unread_where = """messages.role = 'user'
+        AND admin_message_reads.message_id IS NULL
+        AND users.allow_admin_review = 1
+        AND users.store_chats = 1"""
+    with closing(get_connection()) as connection:
+        total_unread = int(
+            connection.execute(
+                f"""SELECT COUNT(*) FROM messages
+                    JOIN users ON users.id = messages.user_id
+                    LEFT JOIN admin_message_reads
+                      ON admin_message_reads.message_id = messages.id
+                    WHERE {unread_where}"""
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            f"""WITH unread AS (
+                   SELECT messages.id, messages.session_id, messages.user_id,
+                          messages.content, messages.created_at
+                   FROM messages
+                   JOIN users ON users.id = messages.user_id
+                   LEFT JOIN admin_message_reads
+                     ON admin_message_reads.message_id = messages.id
+                   WHERE {unread_where}
+               )
+               SELECT unread.session_id, unread.user_id, users.display_name, users.email,
+                      COUNT(*) AS unread_count, MAX(unread.created_at) AS last_activity,
+                      (SELECT latest.id FROM unread AS latest
+                       WHERE latest.session_id = unread.session_id
+                         AND latest.user_id = unread.user_id
+                       ORDER BY latest.id DESC LIMIT 1) AS latest_message_id,
+                      (SELECT latest.content FROM unread AS latest
+                       WHERE latest.session_id = unread.session_id
+                         AND latest.user_id = unread.user_id
+                       ORDER BY latest.id DESC LIMIT 1) AS latest_message_preview,
+                      (SELECT latest.mode FROM messages AS latest
+                       WHERE latest.session_id = unread.session_id
+                         AND latest.user_id = unread.user_id
+                       ORDER BY latest.id DESC LIMIT 1) AS mode,
+                      (SELECT latest.character FROM messages AS latest
+                       WHERE latest.session_id = unread.session_id
+                         AND latest.user_id = unread.user_id
+                       ORDER BY latest.id DESC LIMIT 1) AS character
+               FROM unread
+               JOIN users ON users.id = unread.user_id
+               GROUP BY unread.session_id, unread.user_id, users.display_name, users.email
+               ORDER BY last_activity DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return {
+        "total_unread": total_unread,
+        "conversations": [dict(row) for row in rows],
+    }
+
+
 @app.get("/admin/users/{user_id}", dependencies=[Depends(require_admin_key)])
 def admin_user_detail(user_id: int) -> dict[str, object]:
     with closing(get_connection()) as connection:
         user = connection.execute(
             """SELECT id, email, display_name, language, country, retention_days, store_chats,
                       allow_admin_review, allow_admin_intervention, default_human_control,
-                      terms_version, created_at
+                      terms_version, access_status, preferred_time_slot,
+                      access_approved_at, created_at
                FROM users WHERE id = ?""",
             (user_id,),
         ).fetchone()
@@ -6642,11 +7815,17 @@ def admin_user_detail(user_id: int) -> dict[str, object]:
 def admin_user_sessions(user_id: int) -> list[dict[str, object]]:
     with closing(get_connection()) as connection:
         user = connection.execute(
-            "SELECT allow_admin_review, store_chats FROM users WHERE id = ?", (user_id,)
+            """SELECT allow_admin_review, store_chats, access_status
+               FROM users WHERE id = ?""",
+            (user_id,),
         ).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
-        if not user["allow_admin_review"] or not user["store_chats"]:
+        if (
+            user["access_status"] != "active"
+            or not user["allow_admin_review"]
+            or not user["store_chats"]
+        ):
             raise HTTPException(
                 status_code=403,
                 detail="This account must accept the current Terms before conversation review is available.",
@@ -6658,7 +7837,6 @@ def admin_user_sessions(user_id: int) -> list[dict[str, object]]:
                       (SELECT first_message.content FROM messages AS first_message
                        WHERE first_message.user_id = messages.user_id
                          AND first_message.session_id = messages.session_id
-                         AND first_message.role = 'user'
                        ORDER BY first_message.id ASC LIMIT 1) AS first_user_message,
                       (SELECT latest_message.content FROM messages AS latest_message
                        WHERE latest_message.user_id = messages.user_id
@@ -6708,13 +7886,33 @@ def admin_user_sessions(user_id: int) -> list[dict[str, object]]:
 def admin_session_detail(
     session_id: str,
     record_view: bool = Query(default=True),
+    message_limit: int = Query(default=30, ge=20, le=200),
+    before_id: int | None = Query(default=None, ge=1),
 ) -> dict[str, object]:
     with closing(get_connection()) as connection:
         owner = reviewable_session(connection, session_id)
         if not owner:
             raise HTTPException(status_code=404, detail="A reviewable stored session was not found.")
+        message_snapshot = connection.execute(
+            """SELECT COUNT(*) AS message_count, MAX(id) AS latest_message_id,
+                      MAX(created_at) AS last_activity
+               FROM messages WHERE session_id = ? AND user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+        latest_read_at = connection.execute(
+            """SELECT MAX(message_reads.read_at) FROM message_reads
+               JOIN messages ON messages.id = message_reads.message_id
+               WHERE messages.session_id = ? AND messages.user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()[0]
+        cursor_clause = " AND messages.id < ?" if before_id is not None else ""
+        query_parameters: tuple[object, ...] = (
+            (session_id, owner["user_id"], before_id, message_limit)
+            if before_id is not None
+            else (session_id, owner["user_id"], message_limit)
+        )
         messages = connection.execute(
-            """SELECT messages.id, messages.role, messages.content, messages.mode,
+            f"""SELECT messages.id, messages.role, messages.content, messages.mode,
                       messages.scenario, messages.character, messages.roleplay_intensity,
                       messages.roleplay_difficulty, messages.character_description,
                       messages.created_at, messages.prompt_tokens, messages.completion_tokens,
@@ -6765,8 +7963,10 @@ def admin_session_detail(
                LEFT JOIN message_voice_notes AS voice_note
                  ON voice_note.message_id = messages.id
                WHERE messages.session_id = ? AND messages.user_id = ?
-               ORDER BY messages.id""",
-            (session_id, owner["user_id"]),
+               {cursor_clause}
+               ORDER BY messages.id DESC
+               LIMIT ?""",
+            query_parameters,
         ).fetchall()
         session_control = connection.execute(
             """SELECT mode, prompt_override, roleplay_intensity_override,
@@ -6784,22 +7984,28 @@ def admin_session_detail(
             (session_id, owner["user_id"]),
         ).fetchone()
         if record_view:
+            viewed_at = utc_now()
+            connection.execute(
+                """INSERT OR IGNORE INTO admin_message_reads (message_id, read_at)
+                   SELECT id, ? FROM messages
+                   WHERE session_id = ? AND user_id = ? AND role = 'user'""",
+                (viewed_at, session_id, owner["user_id"]),
+            )
             audit(connection, "view_session", session_id)
         connection.commit()
-    user_typing = False
-    if typing_presence and typing_presence["is_typing"]:
-        try:
-            typing_updated_at = datetime.fromisoformat(
-                str(typing_presence["updated_at"]).replace("Z", "+00:00")
-            )
-            user_typing = (
-                datetime.now(timezone.utc) - typing_updated_at.astimezone(timezone.utc)
-            ) <= timedelta(seconds=8)
-        except ValueError:
-            user_typing = False
+    user_typing = current_typing_presence(typing_presence)
     return {
         "session_id": session_id,
         "user": dict(owner),
+        "message_count": int(message_snapshot["message_count"] or 0),
+        "transcript_revision": ":".join(
+            (
+                str(int(message_snapshot["message_count"] or 0)),
+                str(int(message_snapshot["latest_message_id"] or 0)),
+                str(message_snapshot["last_activity"] or ""),
+                str(latest_read_at or ""),
+            )
+        ),
         "can_intervene": bool(owner["allow_admin_intervention"]),
         "session_control": dict(session_control) if session_control else {
             "mode": "ai", "prompt_override": None, "roleplay_intensity_override": None,
@@ -6807,8 +8013,125 @@ def admin_session_detail(
         },
         "user_prompt_control": dict(user_control) if user_control else None,
         "user_typing": user_typing,
-        "messages": [dict(row) for row in messages],
+        "messages": [dict(row) for row in reversed(messages)],
     }
+
+
+@app.get("/admin/sessions/{session_id}/typing", dependencies=[Depends(require_admin_key)])
+def admin_session_typing_status(session_id: str) -> dict[str, object]:
+    """Return only the short-lived user typing presence needed by the composer."""
+    with closing(get_connection()) as connection:
+        owner = reviewable_session(connection, session_id)
+        if not owner:
+            raise HTTPException(
+                status_code=404,
+                detail="A reviewable stored session was not found.",
+            )
+        typing_presence = connection.execute(
+            """SELECT is_typing, updated_at FROM typing_presence
+               WHERE session_id = ? AND user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+    return {
+        "session_id": session_id,
+        "user_typing": current_typing_presence(typing_presence),
+    }
+
+
+@app.get("/admin/sessions/{session_id}/status", dependencies=[Depends(require_admin_key)])
+def admin_session_status(session_id: str) -> dict[str, object]:
+    """Return only the fields needed by the live administrator transcript header."""
+    with closing(get_connection()) as connection:
+        owner = reviewable_session(connection, session_id)
+        if not owner:
+            raise HTTPException(status_code=404, detail="A reviewable stored session was not found.")
+        message_snapshot = connection.execute(
+            """SELECT COUNT(*) AS message_count, MAX(id) AS latest_message_id,
+                      MAX(created_at) AS last_activity
+               FROM messages WHERE session_id = ? AND user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+        latest_read_at = connection.execute(
+            """SELECT MAX(message_reads.read_at) FROM message_reads
+               JOIN messages ON messages.id = message_reads.message_id
+               WHERE messages.session_id = ? AND messages.user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()[0]
+        control = connection.execute(
+            "SELECT mode, updated_at FROM session_controls WHERE session_id = ? AND user_id = ?",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+        typing_presence = connection.execute(
+            """SELECT is_typing, updated_at FROM typing_presence
+               WHERE session_id = ? AND user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+    user_typing = current_typing_presence(typing_presence)
+    return {
+        "session_id": session_id,
+        "message_count": int(message_snapshot["message_count"] or 0),
+        "transcript_revision": ":".join(
+            (
+                str(int(message_snapshot["message_count"] or 0)),
+                str(int(message_snapshot["latest_message_id"] or 0)),
+                str(message_snapshot["last_activity"] or ""),
+                str(latest_read_at or ""),
+            )
+        ),
+        "control_mode": control["mode"] if control else "ai",
+        "control_updated_at": control["updated_at"] if control else None,
+        "user_typing": user_typing,
+    }
+
+
+def admin_session_live_revision(session_id: str) -> str:
+    with closing(get_connection()) as connection:
+        owner = reviewable_session(connection, session_id)
+        if not owner:
+            raise HTTPException(
+                status_code=404,
+                detail="A reviewable stored session was not found.",
+            )
+        snapshot = connection.execute(
+            """SELECT COUNT(*) AS message_count, MAX(id) AS latest_message_id,
+                      MAX(created_at) AS last_activity
+               FROM messages WHERE session_id = ? AND user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()
+        latest_read_at = connection.execute(
+            """SELECT MAX(message_reads.read_at) FROM message_reads
+               JOIN messages ON messages.id = message_reads.message_id
+               WHERE messages.session_id = ? AND messages.user_id = ?""",
+            (session_id, owner["user_id"]),
+        ).fetchone()[0]
+    return ":".join(
+        (
+            str(int(snapshot["message_count"] or 0)),
+            str(int(snapshot["latest_message_id"] or 0)),
+            str(snapshot["last_activity"] or ""),
+            str(latest_read_at or ""),
+        )
+    )
+
+
+@app.get(
+    "/admin/sessions/{session_id}/live",
+    dependencies=[Depends(require_admin_key)],
+)
+async def wait_for_admin_session_change(
+    session_id: str,
+    revision: str = Query(default=""),
+    timeout_seconds: int = Query(default=25, ge=1, le=30),
+) -> dict[str, object]:
+    """Wait until the administrator transcript revision changes."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        current_revision = admin_session_live_revision(session_id)
+        if current_revision != revision:
+            return {"changed": True, "revision": current_revision}
+        if time.monotonic() >= deadline:
+            return {"changed": False, "revision": current_revision}
+        await asyncio.sleep(0.25)
 
 
 @app.get(
@@ -6936,6 +8259,122 @@ def active_admin_sessions(minutes: int = Query(default=60, ge=5, le=1440)) -> li
     return [dict(row) for row in rows]
 
 
+@app.post("/admin/sessions", status_code=201, dependencies=[Depends(require_admin_key)])
+def create_admin_session(request: AdminSessionCreate) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        user = connection.execute(
+            """SELECT id, display_name, store_chats, allow_admin_review,
+                      allow_admin_intervention, terms_version, access_status
+               FROM users WHERE id = ?""",
+            (request.user_id,),
+        ).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        if (
+            not user["store_chats"]
+            or not user["allow_admin_review"]
+            or not user["allow_admin_intervention"]
+            or user["terms_version"] != CONSENT_VERSION
+            or user["access_status"] != "active"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="This account must accept the current Terms before an administrator can start a conversation.",
+            )
+
+        scenario_slug: str | None = None
+        persona_slug: str | None = None
+        intensity: str | None = None
+        difficulty: str | None = None
+        character_description: str | None = None
+        if request.mode == "partner":
+            persona = catalog_item(connection, "personas", request.persona)
+            if not persona:
+                raise HTTPException(status_code=422, detail="Choose an active Partner character.")
+            scenario_slug = request.scenario or "practice_opening_up"
+            scenario = catalog_item(connection, "scenarios", scenario_slug)
+            if not scenario:
+                raise HTTPException(status_code=422, detail="Choose an active Partner scenario.")
+            persona_slug = str(persona["slug"])
+            intensity = request.roleplay_intensity or "explicit"
+            difficulty = request.roleplay_difficulty or "realistic"
+            character_description = request.character_description
+
+        while True:
+            session_id = f"admin_{secrets.token_urlsafe(18)}"
+            exists = connection.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if not exists:
+                break
+
+        created_at = utc_now()
+        message_cursor = connection.execute(
+            """INSERT INTO messages
+               (session_id, role, content, mode, scenario, character,
+                roleplay_intensity, roleplay_difficulty, character_description,
+                created_at, user_id, prompt_tokens, completion_tokens, model,
+                source, client_platform)
+               VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 'admin', 'web')""",
+            (
+                session_id,
+                request.opening_message,
+                request.mode,
+                scenario_slug,
+                persona_slug,
+                intensity,
+                difficulty,
+                character_description,
+                created_at,
+                request.user_id,
+                model_for_mode(request.mode),
+            ),
+        )
+        message_id = int(message_cursor.lastrowid)
+        connection.execute(
+            """INSERT INTO session_controls
+               (session_id, user_id, mode, prompt_override,
+                roleplay_intensity_override, roleplay_difficulty_override,
+                note, updated_at)
+               VALUES (?, ?, 'human', NULL, NULL, NULL, ?, ?)""",
+            (
+                session_id,
+                request.user_id,
+                "Conversation started by an administrator",
+                created_at,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO admin_message_revisions
+               (message_id, user_id, session_id, channel, original_content,
+                sent_content, review_status, created_at)
+               VALUES (?, ?, ?, 'web', ?, ?, 'not_checked', ?)""",
+            (
+                message_id,
+                request.user_id,
+                session_id,
+                request.opening_message,
+                request.opening_message,
+                created_at,
+            ),
+        )
+        enqueue_telegram_message(connection, request.user_id, session_id, message_id)
+        audit(
+            connection,
+            "create_admin_session",
+            f"{request.user_id}:{session_id}:{request.mode}:{persona_slug or 'none'}",
+        )
+        connection.commit()
+    return {
+        "session_id": session_id,
+        "message_id": message_id,
+        "user_id": request.user_id,
+        "mode": request.mode,
+        "persona": persona_slug,
+    }
+
+
 @app.post("/admin/sessions/{session_id}/control", dependencies=[Depends(require_admin_key)])
 def update_session_control(session_id: str, request: SessionControlRequest) -> dict[str, object]:
     with closing(get_connection()) as connection:
@@ -7017,14 +8456,106 @@ async def check_admin_roman_urdu(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post(
+    "/admin/sessions/{session_id}/voice-transcription",
+    response_model=AdminVoiceTranscriptionResponse,
+    dependencies=[Depends(require_admin_key)],
+)
+def transcribe_admin_voice_draft(
+    session_id: str,
+    request: AdminVoiceTranscriptionRequest,
+    http_request: Request,
+) -> AdminVoiceTranscriptionResponse:
+    enforce_rate_limit(
+        "admin-provider-action",
+        request_source_key(http_request),
+        limit=30,
+        window_seconds=60,
+    )
+    with closing(get_connection()) as connection:
+        eligible = eligible_intervention_session(connection, session_id)
+        control = connection.execute(
+            "SELECT mode FROM session_controls WHERE session_id = ? AND user_id = ?",
+            (session_id, eligible["user_id"] if eligible else -1),
+        ).fetchone()
+        if not eligible or not control or control["mode"] != "human":
+            raise HTTPException(
+                status_code=409,
+                detail="Take human control of this session before recording a reply.",
+            )
+    audio_content, duration_seconds = decode_admin_voice_draft(request.audio_base64)
+    transcript = transcribe_admin_recording(audio_content, request.audio_filename)
+    return AdminVoiceTranscriptionResponse(
+        transcript=transcript,
+        duration_seconds=duration_seconds,
+    )
+
+
+@app.post(
+    "/admin/sessions/{session_id}/voice-preview",
+    response_model=AdminVoicePreviewResponse,
+    dependencies=[Depends(require_admin_key)],
+)
+def create_admin_voice_preview(
+    session_id: str,
+    request: AdminVoicePreviewRequest,
+    http_request: Request,
+) -> AdminVoicePreviewResponse:
+    enforce_rate_limit(
+        "admin-provider-action",
+        request_source_key(http_request),
+        limit=30,
+        window_seconds=60,
+    )
+    with closing(get_connection()) as connection:
+        eligible = eligible_intervention_session(connection, session_id)
+        control = connection.execute(
+            "SELECT mode FROM session_controls WHERE session_id = ? AND user_id = ?",
+            (session_id, eligible["user_id"] if eligible else -1),
+        ).fetchone()
+        if not eligible or not control or control["mode"] != "human":
+            raise HTTPException(
+                status_code=409,
+                detail="Take human control of this session before previewing a reply.",
+            )
+    transcript = request.content
+    if request.recording_base64:
+        recording_content, _ = decode_admin_voice_draft(request.recording_base64)
+        transcript = transcribe_admin_recording(
+            recording_content,
+            request.recording_filename or "admin-voice-draft.wav",
+        )
+    voice_content, duration_seconds = generate_admin_speech(
+        transcript,
+        request.voice_style,
+    )
+    style_name = "seductive" if request.voice_style == "seductive" else "natural"
+    return AdminVoicePreviewResponse(
+        transcript=transcript,
+        audio_base64=base64.b64encode(voice_content).decode("ascii"),
+        audio_filename=f"dilse-troy-{style_name}-preview.wav",
+        duration_seconds=duration_seconds,
+        voice_style=request.voice_style,
+    )
+
+
 @app.post("/admin/sessions/{session_id}/messages", status_code=201, dependencies=[Depends(require_admin_key)])
-def send_admin_session_message(session_id: str, request: AdminSessionMessage) -> dict[str, int | None]:
+def send_admin_session_message(
+    session_id: str,
+    request: AdminSessionMessage,
+    http_request: Request,
+) -> dict[str, int | None]:
+    enforce_rate_limit(
+        "admin-message-send",
+        request_source_key(http_request),
+        limit=60,
+        window_seconds=60,
+    )
     image_content = (
         decode_admin_image(request.image_base64, str(request.image_mime_type))
         if request.image_base64 and request.image_mime_type
         else None
     )
-    stored_content = request.content or "Shared an image."
     with closing(get_connection()) as connection:
         eligible = eligible_intervention_session(connection, session_id)
         control = connection.execute(
@@ -7045,6 +8576,41 @@ def send_admin_session_message(session_id: str, request: AdminSessionMessage) ->
                WHERE session_id = ? AND user_id = ? ORDER BY id DESC LIMIT 1""",
             (session_id, eligible["user_id"]),
         ).fetchone()
+        resolved_content = request.content
+        if request.recording_base64:
+            recording_content, _ = decode_admin_voice_draft(request.recording_base64)
+            resolved_content = transcribe_admin_recording(
+                recording_content,
+                request.recording_filename or "admin-voice-draft.wav",
+            )
+        if (
+            request.delivery_mode in {"text_audio", "audio"}
+            and len(resolved_content) > ADMIN_TTS_MAX_CHARACTERS
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Audio messages must be {ADMIN_TTS_MAX_CHARACTERS} "
+                    "characters or fewer."
+                ),
+            )
+        stored_content = (
+            "Voice note"
+            if request.delivery_mode == "audio"
+            else resolved_content or "Shared an image."
+        )
+        voice_content: bytes | None = None
+        voice_duration: float | None = None
+        if request.delivery_mode in {"text_audio", "audio"}:
+            if request.voice_preview_base64:
+                voice_content, voice_duration = decode_user_voice_note(
+                    request.voice_preview_base64
+                )
+            else:
+                voice_content, voice_duration = generate_admin_speech(
+                    resolved_content,
+                    request.voice_style or "conversational",
+                )
         cursor = connection.execute(
             """INSERT INTO messages
                (session_id, role, content, mode, scenario, character, roleplay_intensity,
@@ -7058,6 +8624,7 @@ def send_admin_session_message(session_id: str, request: AdminSessionMessage) ->
         )
         message_id = int(cursor.lastrowid)
         attachment_id: int | None = None
+        voice_note_id: int | None = None
         if image_content is not None:
             attachment_cursor = connection.execute(
                 """INSERT INTO message_attachments
@@ -7074,12 +8641,30 @@ def send_admin_session_message(session_id: str, request: AdminSessionMessage) ->
                 ),
             )
             attachment_id = int(attachment_cursor.lastrowid)
+        if voice_content is not None and voice_duration is not None:
+            voice_cursor = connection.execute(
+                """INSERT INTO message_voice_notes
+                   (message_id, user_id, filename, mime_type, content, size_bytes,
+                    duration_seconds, upload_id, created_at)
+                   VALUES (?, ?, ?, 'audio/wav', ?, ?, ?, NULL, ?)""",
+                (
+                    message_id,
+                    eligible["user_id"],
+                    request.voice_preview_filename
+                    or f"dilse-{request.voice_style or 'conversational'}-voice.wav",
+                    voice_content,
+                    len(voice_content),
+                    voice_duration,
+                    utc_now(),
+                ),
+            )
+            voice_note_id = int(voice_cursor.lastrowid)
         original_content = (
             request.original_content
             if request.original_content is not None
-            else request.content
+            else resolved_content
         )
-        if original_content or request.content:
+        if original_content or resolved_content:
             connection.execute(
                 """INSERT INTO admin_message_revisions
                    (message_id, user_id, session_id, channel, original_content,
@@ -7090,7 +8675,7 @@ def send_admin_session_message(session_id: str, request: AdminSessionMessage) ->
                     eligible["user_id"],
                     session_id,
                     original_content,
-                    request.content,
+                    resolved_content,
                     request.roman_urdu_review_status,
                     utc_now(),
                 ),
@@ -7101,10 +8686,16 @@ def send_admin_session_message(session_id: str, request: AdminSessionMessage) ->
         audit(
             connection,
             "send_admin_message",
-            f"{session_id}:{message_id}:{request.roman_urdu_review_status}",
+            f"{session_id}:{message_id}:{request.roman_urdu_review_status}:"
+            f"{request.delivery_mode}:{request.voice_style or 'none'}:"
+            f"{request.draft_source}",
         )
         connection.commit()
-    return {"id": message_id, "attachment_id": attachment_id}
+    return {
+        "id": message_id,
+        "attachment_id": attachment_id,
+        "voice_note_id": voice_note_id,
+    }
 
 
 @app.delete(
@@ -7213,6 +8804,56 @@ def admin_visitors(
         "retention_days": VISITOR_RETENTION_DAYS,
         "live_window_seconds": VISITOR_LIVE_SECONDS,
     }
+
+
+@app.get("/admin/ip-blocks", dependencies=[Depends(require_admin_key)])
+def admin_ip_blocks() -> list[dict[str, object]]:
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            "SELECT id, ip_address, note, created_at FROM ip_blocks ORDER BY id DESC"
+        ).fetchall()
+        audit(connection, "view_ip_blocks", f"count:{len(rows)}")
+        connection.commit()
+    return [dict(row) for row in rows]
+
+
+@app.post("/admin/ip-blocks", status_code=201, dependencies=[Depends(require_admin_key)])
+def admin_create_ip_block(request: AdminIPBlockCreate) -> dict[str, object]:
+    with closing(get_connection()) as connection:
+        try:
+            cursor = connection.execute(
+                "INSERT INTO ip_blocks (ip_address, note, created_at) VALUES (?, ?, ?)",
+                (request.ip_address, request.note, utc_now()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="This IP address is already blocked.") from exc
+        block_id = int(cursor.lastrowid)
+        row = connection.execute(
+            "SELECT id, ip_address, note, created_at FROM ip_blocks WHERE id = ?",
+            (block_id,),
+        ).fetchone()
+        audit(connection, "block_ip", request.ip_address)
+        connection.commit()
+    return dict(row)
+
+
+@app.delete(
+    "/admin/ip-blocks/{block_id}",
+    status_code=204,
+    response_class=Response,
+    dependencies=[Depends(require_admin_key)],
+)
+def admin_delete_ip_block(block_id: int) -> Response:
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            "SELECT ip_address FROM ip_blocks WHERE id = ?", (block_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Blocked IP address not found.")
+        connection.execute("DELETE FROM ip_blocks WHERE id = ?", (block_id,))
+        audit(connection, "unblock_ip", str(row["ip_address"]))
+        connection.commit()
+    return Response(status_code=204)
 
 
 @app.get("/admin/app-usage", dependencies=[Depends(require_admin_key)])
@@ -7367,6 +9008,9 @@ def admin_summary() -> dict[str, int]:
             "SELECT COUNT(*) FROM users WHERE terms_version IS NULL OR terms_version != ?",
             (CONSENT_VERSION,),
         ).fetchone()[0]
+        pending_access_users = connection.execute(
+            "SELECT COUNT(*) FROM users WHERE access_status = 'pending'"
+        ).fetchone()[0]
         live_cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=VISITOR_LIVE_SECONDS)
         ).isoformat()
@@ -7380,6 +9024,7 @@ def admin_summary() -> dict[str, int]:
         registered_installations = connection.execute(
             "SELECT COUNT(*) FROM mobile_app_installations"
         ).fetchone()[0]
+        blocked_ips = connection.execute("SELECT COUNT(*) FROM ip_blocks").fetchone()[0]
         app_users = connection.execute(
             "SELECT COUNT(DISTINCT user_id) FROM mobile_app_installations WHERE user_id IS NOT NULL"
         ).fetchone()[0]
@@ -7389,10 +9034,12 @@ def admin_summary() -> dict[str, int]:
     result["stored_users"] = stored_users
     result["intervention_users"] = intervention_users
     result["pending_terms_users"] = pending_terms_users
+    result["pending_access_users"] = pending_access_users
     result["live_visitors"] = live_visitors
     result["visitor_sessions"] = visitor_sessions
     result["registered_installations"] = registered_installations
     result["app_users"] = app_users
+    result["blocked_ips"] = blocked_ips
     return result
 
 
