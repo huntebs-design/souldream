@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import ast
 import os
 import re
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+from types import SimpleNamespace
 
 from streamlit.testing.v1 import AppTest
 
@@ -26,6 +29,8 @@ USER = {
     "email_notifications_enabled": True,
     "terms_version": "2026-08-10-terms-v6",
     "requires_terms_acceptance": False,
+    "access_status": "active",
+    "preferred_time_slot": "flexible",
     "created_at": "2026-08-07T00:00:00+00:00",
 }
 
@@ -49,6 +54,16 @@ CATALOG = {
             "name": "Traditional mother-in-law",
             "description": "A traditional elder responding from her values and family expectations.",
         },
+        {
+            "slug": "crush",
+            "name": "Crush",
+            "description": "An adult romantic interest who is warm, curious, lightly flirtatious, and a little uncertain about mutual feelings.",
+        },
+        {
+            "slug": "fantasy_partner",
+            "name": "Fantasy Partner",
+            "description": "A fictional adult partner who is confident, attentive, affectionate, expressive, and playful.",
+        },
     ],
     "exercises": [],
     "cards": [],
@@ -67,6 +82,9 @@ ADMIN_USER = {
     "store_chats": True,
     "terms_version": "2026-08-10-terms-v6",
     "requires_terms_acceptance": False,
+    "access_status": "active",
+    "preferred_time_slot": "evening",
+    "access_approved_at": "2026-08-07T00:05:00+00:00",
     "created_at": "2026-08-07T00:00:00+00:00",
     "reviewable_sessions": 1,
     "reviewable_messages": 2,
@@ -95,6 +113,9 @@ ADMIN_SESSION = {
 ADMIN_DETAIL = {
     "session_id": ADMIN_SESSION["session_id"],
     "user": ADMIN_USER,
+    "message_count": 2,
+    "transcript_revision": "2:2:2026-08-08T12:05:00+00:00:",
+    "user_typing": False,
     "can_intervene": True,
     "session_control": {
         "mode": "ai",
@@ -154,10 +175,19 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
         return StubResponse(
             {"available": False, "public_key": "", "active_devices": 0}
         )
+    if method == "GET" and url.endswith("/sessions/unread"):
+        return StubResponse({"total_unread": 0, "conversations": []})
     if method == "GET" and url.endswith("/sessions") and "/admin/" not in url:
         return StubResponse([])
     if method == "GET" and "/sessions/" in url and "/sync?" in url:
-        return StubResponse({"mode": "human", "message_ids": [501], "updates": []})
+        return StubResponse(
+            {
+                "mode": "human",
+                "message_count": 1,
+                "message_ids": [501],
+                "updates": [],
+            }
+        )
     if method == "POST" and url.endswith("/chat"):
         return StubResponse(
             {
@@ -183,12 +213,15 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
                 "completion_tokens": 30,
                 "intervention_users": 1,
                 "pending_terms_users": 0,
+                "pending_access_users": 0,
                 "live_visitors": 1,
                 "visitor_sessions": 2,
                 "registered_installations": 1,
                 "app_users": 1,
             }
         )
+    if method == "GET" and url.endswith("/admin/access-settings"):
+        return StubResponse({"require_approval_for_new_accounts": True})
     if method == "GET" and url.endswith("/admin/visitors?limit=200"):
         return StubResponse(
             {
@@ -270,6 +303,8 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
         return StubResponse([ADMIN_USER])
     if method == "GET" and url.endswith("/admin/sessions/active?minutes=60"):
         return StubResponse([])
+    if method == "GET" and url.endswith("/admin/inbox?limit=20"):
+        return StubResponse({"total_unread": 0, "conversations": []})
     if method == "GET" and url.endswith(f"/admin/users/{ADMIN_USER['id']}"):
         return StubResponse(
             {
@@ -280,6 +315,27 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
         )
     if method == "GET" and url.endswith(f"/admin/users/{ADMIN_USER['id']}/sessions"):
         return StubResponse([ADMIN_SESSION])
+    if method == "GET" and url.endswith(
+        f"/admin/sessions/{ADMIN_SESSION['session_id']}/typing"
+    ):
+        return StubResponse(
+            {
+                "session_id": ADMIN_SESSION["session_id"],
+                "user_typing": ADMIN_DETAIL.get("user_typing", False),
+            }
+        )
+    if method == "GET" and url.endswith(
+        f"/admin/sessions/{ADMIN_SESSION['session_id']}/status"
+    ):
+        return StubResponse(
+            {
+                "session_id": ADMIN_SESSION["session_id"],
+                "message_count": ADMIN_DETAIL["message_count"],
+                "transcript_revision": ADMIN_DETAIL["transcript_revision"],
+                "control_mode": ADMIN_DETAIL["session_control"]["mode"],
+                "user_typing": ADMIN_DETAIL.get("user_typing", False),
+            }
+        )
     if method == "GET" and url.split("?", 1)[0].endswith(f"/admin/sessions/{ADMIN_SESSION['session_id']}/detail"):
         return StubResponse(ADMIN_DETAIL)
     if method == "DELETE" and "/admin/sessions/" in url and "/messages/" in url:
@@ -314,6 +370,49 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
 
 
 class DilSeStreamlitTests(unittest.TestCase):
+    def test_public_terms_page_preserves_existing_sections(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        with patch("requests.request", side_effect=fake_request):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.query_params["page"] = "terms"
+            app.run()
+
+            markdown = "\n".join(str(item.value) for item in app.markdown)
+            self.assertNotIn("Draft for private MVP testing", markdown)
+            self.assertIn("What you are agreeing to", markdown)
+            self.assertNotIn("administrator", markdown.lower())
+            self.assertIn("Required account processing", markdown)
+            self.assertEqual(
+                app_path.read_text(encoding="utf-8").count("Required account processing"),
+                1,
+            )
+
+
+    def test_admin_incoming_message_does_not_unmount_recording_draft(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+        function = next(
+            node for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name == "render_admin_live_status"
+        )
+        function.decorator_list = []
+        state = {
+            "admin_composer_nonces": {"fixture": 2},
+            "admin_draft_source_fixture_2": "Record",
+        }
+        streamlit = SimpleNamespace(session_state=state, rerun=Mock(), markdown=Mock())
+        namespace = {
+            "st": streamlit, "Any": object, "html": __import__("html"),
+            "admin_json": lambda *args: {"message_count": 3},
+            "admin_transcript_signature": lambda status: "new-message",
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "app.py", "exec"), namespace)
+        refresh = namespace["render_admin_live_status"]
+        refresh("fixture", {}, "previous-message")
+        streamlit.rerun.assert_not_called()
+        state["admin_draft_source_fixture_2"] = "Type"
+        refresh("fixture", {}, "previous-message")
+        streamlit.rerun.assert_called_once_with(scope="app")
+
     def test_internal_landing_links_stay_in_the_current_tab(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         source = app_path.read_text(encoding="utf-8")
@@ -341,25 +440,6 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertTrue(any(item.label == "Sign in" for item in app.button))
         self.assertTrue(any(item.label == "Create account" for item in app.button))
 
-    def test_terms_page_uses_storage_disclosure_without_admin_wording(self) -> None:
-        app_path = Path(__file__).resolve().parents[1] / "app.py"
-        with patch("requests.request", side_effect=fake_request):
-            app = AppTest.from_file(str(app_path), default_timeout=10)
-            app.query_params["page"] = "terms"
-            app.run()
-
-            markdown = "\n".join(str(item.value) for item in app.markdown)
-            self.assertNotIn("Draft for private MVP testing", markdown)
-            self.assertIn("What you are agreeing to", markdown)
-            self.assertNotIn("administrator", markdown.lower())
-            self.assertIn("Conversation storage is required while your account is active", markdown)
-            self.assertIn("Required account processing", markdown)
-            self.assertIn("optional voice notes", markdown)
-            self.assertIn("deleted with the message, conversation, or account", markdown)
-            self.assertEqual(
-                app_path.read_text(encoding="utf-8").count("Required account processing"),
-                1,
-            )
 
     def test_signup_keeps_processing_disclosure_on_terms_page_only(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -376,6 +456,42 @@ class DilSeStreamlitTests(unittest.TestCase):
                 markdown,
             )
             self.assertIn("I Agree with the Terms and Conditions", checkbox_labels)
+
+    def test_waitlisted_account_sees_availability_message_without_admin_wording(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        pending_user = {
+            **USER,
+            "access_status": "pending",
+            "preferred_time_slot": "evening",
+        }
+
+        def waitlist_request(method: str, url: str, **kwargs: object) -> StubResponse:
+            if method == "GET" and url.endswith("/auth/me"):
+                return StubResponse(pending_user)
+            return fake_request(method, url, **kwargs)
+
+        with patch("requests.request", side_effect=waitlist_request):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.run()
+            app.session_state["auth_token"] = "waitlist-test-token"
+            app.session_state["user"] = pending_user
+            app.run()
+
+            markdown = "\n".join(str(item.value) for item in app.markdown).lower()
+            waitlist_copy = markdown.rsplit('<main class="waitlist-stage">', 1)[-1]
+            self.assertIn("your account is on the dilse waitlist", waitlist_copy)
+            self.assertIn("check back in a few hours", waitlist_copy)
+            self.assertIn("6:00 pm to 10:00 pm pkt", waitlist_copy)
+            self.assertNotIn("admin", waitlist_copy)
+            self.assertTrue(any(item.label == "Check access again" for item in app.button))
+            self.assertFalse(any(item.label == "Account options" for item in app.expander))
+
+        source = app_path.read_text(encoding="utf-8")
+        self.assertIn('admin_json("GET", "/admin/access-settings")', source)
+        self.assertIn("Activate account", source)
+        self.assertIn("Starting reply mode", source)
+        self.assertNotIn("popular usage", source.lower())
+        self.assertNotIn("server capacity", source.lower())
 
     def test_terms_link_moves_from_public_header_to_signed_in_settings(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -707,23 +823,74 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('[data-testid="stChatMessageAvatarCustom"]', source)
         self.assertIn("flex-direction: row-reverse", source)
 
-    def test_conversation_memory_review_stays_collapsed(self) -> None:
+    def test_conversation_memory_review_is_not_shown(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         source = app_path.read_text(encoding="utf-8")
 
-        self.assertIn(
-            'with st.expander("Review what DilSe remembers", expanded=False):',
-            source,
-        )
+        self.assertNotIn("Review what DilSe remembers", source)
+        self.assertNotIn('st.container(key="user_memory_review")', source)
         self.assertNotIn(
-            'with st.expander("Check what DilSe understands", expanded=True):',
+            'f"/sessions/{st.session_state.session_id}/state"',
             source,
         )
+        self.assertNotIn("Turn this conversation into something useful", source)
+        self.assertNotIn("Create a message I can send", source)
+        self.assertNotIn("Give me 3 ways to say it", source)
+        self.assertNotIn("Give me one next step", source)
+        self.assertNotIn("Do you feel more ready for the real conversation?", source)
+        self.assertNotIn("render_v2_conversation_outcomes", source)
+        self.assertNotIn("v2_readiness_saved", source)
+
+    def test_mobile_chat_prioritizes_messages_voice_and_composer(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertIn("def is_mobile_browser() -> bool:", source)
+        self.assertIn(
+            "if mobile_browser and not st.session_state.mobile_conversation_settings_open:",
+            source,
+        )
+        self.assertIn("settings = current_conversation_settings(catalog, experience_v2)", source)
+        self.assertNotIn("Response options", source)
+        self.assertNotIn("Reply tools", source)
+        self.assertNotIn("render_response_options_panel", source)
+        self.assertNotIn("refine_shorter", source)
+        self.assertNotIn("refine_direct", source)
+        self.assertNotIn("refine_voice", source)
+        self.assertNotIn("user_response_options", source)
+        self.assertNotIn("if checkpoint and not mobile_browser:", source)
+        self.assertIn(".st-key-user_voice_note_composer", source)
+        self.assertIn(".st-key-user_compact_composer", source)
+        self.assertIn('"Record voice note" if mobile_browser else "Voice note"', source)
+        self.assertIn("padding-left: 3rem !important", source)
+        self.assertIn("height: clamp(330px, calc(100dvh - 225px), 640px)", source)
+        self.assertIn("justify-content: safe flex-end", source)
+        self.assertIn(
+            '.st-key-user_chat_transcript > [data-testid="stVerticalBlockBorderWrapper"]',
+            source,
+        )
+        self.assertIn(
+            '.st-key-user_chat_transcript > [data-testid="stElementContainer"]:has(.dilse-chat-scroll-anchor)',
+            source,
+        )
+        self.assertIn('div[class*="st-key-transcript_history_"]', source)
+        self.assertIn("def scroll_mobile_chat_to_composer(", source)
+        self.assertIn("composer.scrollIntoView", source)
+        self.assertIn("st.session_state.scroll_chat_composer = True", source)
+        self.assertIn("st.session_state.scroll_dashboard_top = False", source)
+        self.assertIn(
+            'if st.session_state.get("scroll_chat_composer"):',
+            source,
+        )
+        self.assertIn('"New",\n                on_click=reset_local_conversation', source)
 
     def test_user_and_admin_chats_follow_new_messages(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         source = app_path.read_text(encoding="utf-8")
 
+        self.assertNotIn("components.html(", source)
+        self.assertNotIn("st.iframe(", source)
+        self.assertIn("unsafe_allow_javascript=True", source)
         self.assertIn("def follow_latest_chat_message(", source)
         self.assertIn("__dilseChatFollowState", source)
         self.assertIn("const findScrollContainer", source)
@@ -733,8 +900,18 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('behavior: "auto"', source)
         self.assertNotIn("target.scrollIntoView", source)
         self.assertIn('data-dilse-chat-anchor=', source)
-        self.assertIn("followState[scrollKey] = signature", source)
+        self.assertIn("historyWasPrepended", source)
+        self.assertIn("followState[scrollKey] = {{signature, messageKeys}}", source)
         self.assertIn("parentWindow.setTimeout(() => moveToLatest(true), 700)", source)
+        self.assertIn("def transcript_history_event(", source)
+        self.assertNotIn("transcript_scroll_component(", source)
+        self.assertNotIn('"dilse_transcript_scroll"', source)
+        self.assertIn('"Load older messages"', source)
+        self.assertIn("button.click();", source)
+        self.assertIn("__dilseTranscriptPagingState", source)
+        self.assertIn("load_earlier_user_messages(before_id)", source)
+        self.assertIn("load_earlier_admin_messages(", source)
+        self.assertNotIn("Load earlier messages", source)
         self.assertIn('key="user_chat_transcript"', source)
         self.assertIn('key=f"admin_chat_transcript_{selected_session_id}"', source)
         self.assertIn('height=520', source)
@@ -742,7 +919,17 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('follow_latest_chat_message(\n                "user",', source)
         self.assertIn('follow_latest_chat_message("admin", selected_session_id, messages)', source)
         self.assertIn('@st.fragment(run_every="1s")\ndef render_admin_live_status(', source)
-        self.assertIn("detail?record_view=false", source)
+        self.assertIn(f'/admin/sessions/{{selected_session_id}}/status', source)
+        live_fragment = source[
+            source.index('@st.fragment(run_every="1s")\ndef render_admin_live_status('):
+            source.index("def render_admin_transcript(")
+        ]
+        self.assertNotIn("detail?record_view=false", live_fragment)
+        self.assertIn(
+            "_legacy_live_updates_component = components.declare_component(",
+            source,
+        )
+        self.assertNotIn("live_event = live_updates_component(", source)
 
     def test_admin_composer_stays_outside_live_refresh_fragment(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -764,6 +951,10 @@ class DilSeStreamlitTests(unittest.TestCase):
             "        selected_session,\n"
             "        detail,\n"
             "    )\n"
+            "    render_admin_composer_typing_status(\n"
+            "        selected_session_id,\n"
+            "        selected_user,\n"
+            "    )\n"
             "    render_admin_transcript_composer(",
             source,
         )
@@ -780,51 +971,265 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('data-dilse-admin-badge="true"', source)
         self.assertIn("show_admin_chat_unread_badge(selected_session_id, messages)", source)
 
-    def test_typing_transport_is_retained_but_not_mounted_in_user_chat(self) -> None:
+    def test_unread_notifications_link_users_and_admins_to_new_messages(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
-        component_path = app_path.parent / "components" / "typing_capture" / "index.html"
-        source = app_path.read_text(encoding="utf-8")
-        component_source = component_path.read_text(encoding="utf-8")
 
-        self.assertTrue(component_path.exists())
-        self.assertIn("components.declare_component", source)
-        self.assertIn("def publish_user_typing_state(", source)
-        self.assertIn('f"/sessions/{session_id}/typing"', source)
-        self.assertNotIn(
-            "publish_user_typing_state(str(st.session_state.session_id))", source
+        def notification_request(method: str, url: str, **kwargs: object) -> StubResponse:
+            if method == "GET" and url.endswith("/sessions/unread"):
+                return StubResponse(
+                    {
+                        "total_unread": 1,
+                        "conversations": [
+                            {
+                                "session_id": ADMIN_SESSION["session_id"],
+                                "unread_count": 1,
+                                "latest_message_preview": "A new reply is waiting.",
+                            }
+                        ],
+                    }
+                )
+            if method == "GET" and url.endswith("/admin/inbox?limit=20"):
+                return StubResponse(
+                    {
+                        "total_unread": 1,
+                        "conversations": [
+                            {
+                                "session_id": ADMIN_SESSION["session_id"],
+                                "user_id": ADMIN_USER["id"],
+                                "display_name": ADMIN_USER["display_name"],
+                                "unread_count": 1,
+                                "mode": "listener",
+                                "latest_message_preview": "I sent a new message.",
+                            }
+                        ],
+                    }
+                )
+            if method == "GET" and url.endswith("/admin/sessions/active?minutes=60"):
+                return StubResponse(
+                    [
+                        {
+                            **ADMIN_SESSION,
+                            "user_id": ADMIN_USER["id"],
+                            "email": ADMIN_USER["email"],
+                            "display_name": ADMIN_USER["display_name"],
+                            "conversation_mode": "listener",
+                            "control_mode": "human",
+                        }
+                    ]
+                )
+            return fake_request(method, url, **kwargs)
+
+        with patch("requests.request", side_effect=notification_request):
+            user_app = AppTest.from_file(str(app_path), default_timeout=10)
+            user_app.run()
+            user_app.session_state["auth_token"] = "ui-test-token"
+            user_app.session_state["user"] = USER
+            user_app.run()
+            self.assertTrue(
+                any(item.label == "Open conversation" for item in user_app.button)
+            )
+            self.assertTrue(
+                any("A new reply is waiting." in str(item.value) for item in user_app.markdown)
+            )
+
+            admin_app = AppTest.from_file(str(app_path), default_timeout=10)
+            admin_app.query_params["admin"] = "1"
+            admin_app.run()
+            admin_app.session_state["admin_key"] = "test-admin-key"
+            admin_app.session_state["admin_page"] = "Overview"
+            admin_app.run()
+            self.assertTrue(
+                any("I sent a new message." in str(item.value) for item in admin_app.markdown)
+            )
+            self.assertTrue(
+                any("Needs reply · 1 new" in str(item.value) for item in admin_app.markdown)
+            )
+            admin_app.button(
+                key=f"open_admin_unread_{ADMIN_SESSION['session_id']}"
+            ).click().run()
+            self.assertEqual(admin_app.session_state["admin_page"], "Conversations")
+            self.assertEqual(
+                admin_app.session_state["admin_selected_user_id"], ADMIN_USER["id"]
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_selected_session_id"],
+                ADMIN_SESSION["session_id"],
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_mobile_page_picker"],
+                "Conversations",
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_case_user_picker"],
+                ADMIN_USER["id"],
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_case_session_picker"],
+                ADMIN_SESSION["session_id"],
+            )
+            admin_app.run()
+            self.assertEqual(admin_app.session_state["admin_page"], "Conversations")
+            self.assertTrue(
+                any(
+                    "Mere husband ne kal meri kalai pakri." in str(item.value)
+                    for item in admin_app.markdown
+                )
+            )
+
+        source = app_path.read_text(encoding="utf-8")
+        self.assertIn('@st.fragment(run_every="5s")\ndef render_user_unread_bubble()', source)
+        self.assertIn('@st.fragment(run_every="5s")\ndef render_admin_inbox_notification()', source)
+        self.assertIn(".st-key-user_unread_bar", source)
+        self.assertIn(".st-key-admin_inbox_bar", source)
+        self.assertIn("background: #c83245", source)
+
+    def test_admin_active_conversation_switcher_opens_each_chat(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        active_session = {
+            **ADMIN_SESSION,
+            "user_id": ADMIN_USER["id"],
+            "email": ADMIN_USER["email"],
+            "display_name": ADMIN_USER["display_name"],
+            "conversation_mode": "listener",
+            "control_mode": "human",
+        }
+
+        def active_request(method: str, url: str, **kwargs: object) -> StubResponse:
+            if method == "GET" and url.endswith("/admin/sessions/active?minutes=60"):
+                return StubResponse([active_session])
+            if method == "GET" and url.endswith("/admin/inbox?limit=20"):
+                return StubResponse({"total_unread": 0, "conversations": []})
+            return fake_request(method, url, **kwargs)
+
+        with patch("requests.request", side_effect=active_request):
+            admin_app = AppTest.from_file(str(app_path), default_timeout=10)
+            admin_app.query_params["admin"] = "1"
+            admin_app.run()
+            admin_app.session_state["admin_key"] = "test-admin-key"
+            admin_app.session_state["admin_page"] = "Overview"
+            admin_app.run()
+
+            self.assertTrue(
+                any(
+                    ADMIN_SESSION["latest_message_preview"] in str(item.value)
+                    for item in admin_app.markdown
+                )
+            )
+            admin_app.button(
+                key=f"open_admin_active_{ADMIN_SESSION['session_id']}"
+            ).click().run()
+            self.assertEqual(admin_app.session_state["admin_page"], "Conversations")
+            self.assertEqual(
+                admin_app.session_state["admin_selected_user_id"], ADMIN_USER["id"]
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_selected_session_id"],
+                ADMIN_SESSION["session_id"],
+            )
+
+        source = app_path.read_text(encoding="utf-8")
+        self.assertIn("def open_admin_conversation_from_switcher(", source)
+        self.assertIn("admin-conversation-switcher-marker", source)
+        self.assertIn("admin-conversation-menu-item", source)
+        self.assertIn('f"open_admin_active_{session_id}"', source)
+        self.assertIn("Needs reply", source)
+
+    def test_admin_user_history_opens_chat_and_stays_open(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+
+        with patch("requests.request", side_effect=fake_request):
+            admin_app = AppTest.from_file(str(app_path), default_timeout=10)
+            admin_app.query_params["admin"] = "1"
+            admin_app.run()
+            admin_app.session_state["admin_key"] = "test-admin-key"
+            admin_app.session_state["admin_page"] = "Users"
+            admin_app.run()
+
+            admin_app.button(
+                key=f"user_open_session_{ADMIN_SESSION['session_id']}"
+            ).click().run()
+            self.assertEqual(admin_app.session_state["admin_page"], "Conversations")
+            self.assertEqual(
+                admin_app.session_state["admin_selected_user_id"], ADMIN_USER["id"]
+            )
+            self.assertEqual(
+                admin_app.session_state["admin_selected_session_id"],
+                ADMIN_SESSION["session_id"],
+            )
+            self.assertTrue(
+                any(
+                    "Mere husband ne kal meri kalai pakri." in str(item.value)
+                    for item in admin_app.markdown
+                )
+            )
+
+            admin_app.run()
+            self.assertEqual(admin_app.session_state["admin_page"], "Conversations")
+            self.assertEqual(
+                admin_app.session_state["admin_selected_session_id"],
+                ADMIN_SESSION["session_id"],
+            )
+
+    def test_browser_posts_read_and_typing_without_streamlit_callbacks(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertIn("def mount_user_chat_transport(", source)
+        self.assertIn(
+            "mount_user_chat_transport(str(st.session_state.session_id))", source
         )
-        self.assertIn('detail.get("user_typing")', source)
+        self.assertIn('status.get("user_typing")', source)
         self.assertIn("is typing…", source)
         self.assertIn('class="admin-typing-bubble"', source)
         self.assertIn('role="status" aria-live="polite"', source)
-        self.assertIn("streamlit:setComponentValue", component_source)
-        self.assertIn("installRecordingGuard", component_source)
-        self.assertIn("dilse:voice-recording", component_source)
-        self.assertIn('event_type: "recording"', component_source)
-        self.assertIn('event.get("event_type") == "recording"', source)
+        self.assertIn(
+            '@st.fragment(run_every="2s")\n'
+            'def render_admin_composer_typing_status(',
+            source,
+        )
+        self.assertIn('f"/admin/sessions/{selected_session_id}/typing"', source)
+        self.assertIn('.st-key-admin_composer_presence', source)
+        self.assertNotIn("typing_capture_component(", source)
+        self.assertNotIn('"dilse_typing_capture"', source)
+        self.assertIn("__dilseChatTransport", source)
+        self.assertIn("postSessionEvent", source)
+        self.assertIn(
+            '`/api/sessions/${{encodeURIComponent(sessionId)}}/${{eventName}}`',
+            source,
+        )
+        self.assertIn('"X-User-Token": userToken', source)
+        self.assertIn('postSessionEvent("typing", {{ is_typing: nextState }})', source)
+        self.assertIn('"read",\n                            {{ message_ids: messageIds }}', source)
+        self.assertNotIn('event.get("event_type") == "typing"', source)
+        self.assertNotIn('f"/sessions/{session_id}/read"', source)
+        self.assertNotIn('f"/sessions/{session_id}/typing"', source)
+        self.assertNotIn("installRecordingGuard", source)
+        self.assertNotIn("dilse:voice-recording", source)
+        self.assertNotIn("recordingButton", source)
+        self.assertNotIn('st.button("Voice recording started"', source)
+        self.assertNotIn('st.button("Voice recording stopped"', source)
+        self.assertIn("on_dismiss=close_user_voice_note_dialog", source)
+        self.assertIn("st.session_state.voice_recording_active = True", source)
+        self.assertIn("st.session_state.voice_recording_active = False", source)
         self.assertIn('st.session_state.get("voice_recording_active")', source)
         self.assertIn("voice_recording_pending_refresh", source)
-        self.assertIn('[data-testid="stChatInput"] textarea', component_source)
-        self.assertIn("assistant_message_ids=assistant_message_ids", source)
-        self.assertIn("confirmed_read_ids=confirmed_read_ids", source)
-        self.assertIn('f"/sessions/{session_id}/read"', source)
-        self.assertIn('event_type: "read"', component_source)
-        self.assertIn("sendReadReceipts", component_source)
-        self.assertIn("suppressEventsUntil = Date.now() + 2500", component_source)
-        self.assertIn("onComposerPointerDown", component_source)
-        self.assertNotIn('sendTyping(false, true);', component_source)
-        self.assertIn("pendingReadIds", component_source)
-        self.assertIn("confirmed_read_ids", component_source)
-        self.assertIn("IntersectionObserver", component_source)
+        self.assertIn('[data-testid="stChatInput"] textarea', source)
+        self.assertIn("assistantMessageIds", source)
+        self.assertIn("sendReadReceipts", source)
+        self.assertIn("state.suppressEventsUntil = Date.now() + 2500", source)
+        self.assertIn("onComposerPointerDown", source)
+        self.assertIn('sendTyping(false, true);', source)
+        self.assertIn("pendingReadIds", source)
+        self.assertIn("confirmedReadIds", source)
+        self.assertIn("IntersectionObserver", source)
         self.assertIn("data-dilse-read-message-id", source)
-        self.assertIn("receipt_response.status_code == 200", source)
         self.assertIn("admin-read-receipt", source)
         self.assertIn("admin-message-meta-copy", source)
         self.assertIn("--admin-bubble-pad-x", source)
         self.assertIn("background: #245e58", source)
         self.assertIn("overflow-wrap: anywhere", source)
         self.assertIn("white-space: pre-wrap", source)
-        self.assertIn('with st.expander("Image attachment", expanded=bool(retained_image)):', source)
+        self.assertIn('with st.expander(image_label, expanded=False):', source)
         self.assertNotIn('st.button("Refresh transcript"', source)
 
         with patch.dict(ADMIN_DETAIL, {"user_typing": True}), patch(
@@ -842,6 +1247,22 @@ class DilSeStreamlitTests(unittest.TestCase):
             rendered = "\n".join(str(item.value) for item in admin_app.markdown)
             self.assertIn("Nadia</strong> is typing", rendered)
             self.assertIn("admin-typing-bubble", rendered)
+            self.assertLess(
+                rendered.index("Nadia</strong> is typing"),
+                rendered.index("Write the next DilSe message"),
+            )
+            self.assertGreater(
+                rendered.index("Nadia</strong> is typing"),
+                rendered.index("Kya yeh pehli baar hua"),
+            )
+        conversation_renderer = source[
+            source.index("def render_admin_conversations(") :
+            source.index("def render_admin_live(")
+        ]
+        self.assertLess(
+            conversation_renderer.index("render_admin_composer_typing_status("),
+            conversation_renderer.index("render_admin_transcript_composer("),
+        )
         self.assertIn('receipt_label = "Read" if read_at else "Unread"', source)
         self.assertIn('message.get("read_basis") == "reply"', source)
 
@@ -856,6 +1277,7 @@ class DilSeStreamlitTests(unittest.TestCase):
 
             app.button(key="new_chat_choose_listener").click().run()
             app.chat_input[0].set_value("I need help with a difficult conversation.").run()
+            self.assertEqual(list(app.exception), [])
 
             sent_messages = [
                 item
@@ -873,9 +1295,9 @@ class DilSeStreamlitTests(unittest.TestCase):
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         source = app_path.read_text(encoding="utf-8")
 
-        self.assertIn('@st.fragment(run_every="500ms")\ndef watch_live_session()', source)
+        self.assertIn('@st.fragment(run_every="1s")\ndef watch_live_session()', source)
         self.assertIn('if not user or not st.session_state.auth_token or not user.get("store_chats"):', source)
-        self.assertIn('/sync?after_id={st.session_state.last_message_id}', source)
+        self.assertIn('&known_count={known_count}', source)
         self.assertIn('"source": item.get("source") or "ai"', source)
         self.assertNotIn('if item["source"] == "admin":', source)
         self.assertNotIn("DilSe team", source)
@@ -889,23 +1311,54 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn("/account/notifications", source)
         self.assertIn("send one private reminder within an hour", source)
 
+    def test_account_deletion_collects_a_reason_and_shows_a_receipt(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertIn("Why are you leaving? (optional)", source)
+        self.assertIn('"departure_reason": ACCOUNT_DELETION_REASONS[', source)
+        self.assertIn("def complete_account_deletion(", source)
+        self.assertIn("def render_account_deletion_confirmation(", source)
+        self.assertIn("Your DilSe account has been deleted.", source)
+        self.assertIn("Historical protected backups", source)
+        self.assertIn("if response.status_code == 200:", source)
+        account_section = source[
+            source.index("def render_account()") : source.index("def set_main_page(")
+        ]
+        self.assertNotIn("if response.status_code == 204:", account_section)
+
+        with patch("requests.request", side_effect=fake_request):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.run()
+            app.session_state["account_deletion_receipt"] = {
+                "deleted_at": "2026-09-05T17:30:00+00:00",
+                "confirmation_reference": "DIL-20260905-ABC123",
+                "email_sent": True,
+                "departure_reason": "Privacy or trust concerns",
+            }
+            app.run()
+
+            rendered = "\n".join(str(item.value) for item in app.markdown)
+            self.assertIn("Your DilSe account has been deleted.", rendered)
+            self.assertIn("DIL-20260905-ABC123", rendered)
+            self.assertIn("Privacy or trust concerns", rendered)
+            self.assertIn("A copy of this confirmation was sent", rendered)
+            self.assertEqual(len(app.text_input), 0)
+
     def test_account_offers_private_android_phone_alerts_outside_chat(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
-        component_path = app_path.parent / "components" / "phone_alerts" / "index.html"
-        worker_path = app_path.parent / "components" / "phone_alerts" / "push-sw.js"
+        worker_path = app_path.parent / "public" / "dilse-push-sw.js"
         source = app_path.read_text(encoding="utf-8")
-        component_source = component_path.read_text(encoding="utf-8")
         worker_source = worker_path.read_text(encoding="utf-8")
 
         self.assertIn("def render_phone_alert_settings()", source)
-        self.assertIn('"/account/push/subscriptions"', source)
-        self.assertIn('"/account/push/unsubscribe"', source)
-        self.assertIn(
-            'sw_url="/component/app.dilse_phone_alerts/push-sw.js"', source
-        )
-        self.assertIn("Notification.requestPermission()", component_source)
-        self.assertIn("pushManager.subscribe", component_source)
-        self.assertIn("No message text is shown", component_source)
+        self.assertNotIn("phone_alerts_component(", source)
+        self.assertNotIn('"dilse_phone_alerts"', source)
+        self.assertIn('`/api/account/push/${{path}}`', source)
+        self.assertIn('"/site/dilse-push-sw.js"', source)
+        self.assertIn("Notification.requestPermission()", source)
+        self.assertIn("pushManager.subscribe", source)
+        self.assertIn("No message text is shown", source)
         self.assertIn('self.addEventListener("push"', worker_source)
         self.assertIn('client.visibilityState === "visible"', worker_source)
         self.assertIn("A DilSe response is waiting for you.", worker_source)
@@ -916,6 +1369,11 @@ class DilSeStreamlitTests(unittest.TestCase):
         source = app_path.read_text(encoding="utf-8")
 
         self.assertIn('st.audio_input(', source)
+        self.assertIn('@st.dialog(', source)
+        self.assertIn('"Voice note",', source)
+        self.assertIn("on_dismiss=close_user_voice_note_dialog", source)
+        self.assertIn("def render_user_voice_note_dialog(", source)
+        self.assertNotIn('with st.popover(\n                "Record voice note"', source)
         self.assertIn('"Send voice note"', source)
         self.assertIn('/voice-notes"', source)
         self.assertIn('"upload_id": upload_id', source)
@@ -923,6 +1381,28 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('voice_note_uploads.get(upload_id) == "sent"', source)
         self.assertIn('f"/admin/messages/{message_id}/voice-note"', source)
         self.assertIn('st.audio(', source)
+        self.assertIn('f"Play voice note{duration_label}"', source)
+        self.assertIn('icon=":material/play_arrow:"', source)
+        self.assertIn('"Close voice note"', source)
+        self.assertIn('div[class*="st-key-open_voice_note_"] .stButton button', source)
+        self.assertIn('-webkit-text-fill-color: #173f3b !important', source)
+        self.assertIn('width: min(100%, 250px) !important', source)
+        self.assertIn('[data-testid="stChatMessageContent"] [data-testid="stAudio"]', source)
+        self.assertIn('width: min(78%, 680px)', source)
+        self.assertIn(
+            'DILSE_MESSAGE_MEDIA_CACHE_MAX_BYTES", str(100 * 1024 * 1024)',
+            source,
+        )
+        self.assertIn(
+            'DILSE_MESSAGE_MEDIA_MAX_OPEN_VOICE_NOTES", "6"',
+            source,
+        )
+        self.assertIn(
+            'set_message_media_scope(f"admin:{selected_session_id}")', source
+        )
+        self.assertIn(
+            'set_message_media_scope(f"user:{st.session_state.session_id}")', source
+        )
         self.assertIn("def admin_transcript_signature(", source)
         self.assertIn("def render_admin_live_status(", source)
         self.assertIn("def render_admin_transcript(", source)
@@ -983,14 +1463,29 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertTrue(app.session_state["conversation_mode_confirmed"])
             self.assertEqual(app.session_state["conversation_mode"], "The Partner")
             self.assertTrue(any(item.key == "v2_persona_husband" for item in app.button))
+            self.assertTrue(any(item.key == "v2_persona_crush" for item in app.button))
+            self.assertTrue(any(item.key == "v2_persona_fantasy_partner" for item in app.button))
 
-    def test_ai_replies_have_a_configurable_minimum_display_delay(self) -> None:
+            app.button(key="v2_persona_crush").click().run()
+
+            self.assertEqual(len(app.chat_input), 1)
+            self.assertIn("Add optional details", app.chat_input[0].placeholder)
+            markdown = "\n".join(str(item.value) for item in app.markdown)
+            self.assertIn("built-in personality is ready", markdown)
+
+            opening = "Your name is Ayaan and you are shy but funny. I need to tell you something."
+            app.chat_input[0].set_value(opening).run()
+
+            self.assertEqual(app.session_state["character_description"], opening)
+            self.assertEqual(app.session_state["messages"][0]["content"], opening)
+
+    def test_ai_replies_are_not_held_back_by_an_artificial_display_delay(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
         source = app_path.read_text(encoding="utf-8")
 
-        self.assertIn('DILSE_AI_REPLY_MIN_DELAY_SECONDS", "2.5"', source)
-        self.assertIn('if result.get("delivery") == "ai":', source)
-        self.assertIn("time.sleep(remaining_delay)", source)
+        self.assertNotIn("DILSE_AI_REPLY_MIN_DELAY_SECONDS", source)
+        self.assertNotIn("time.sleep(remaining_delay)", source)
+        self.assertIn("USER_TRANSCRIPT_PAGE_SIZE = 30", source)
 
     def test_login_persistence_and_three_panel_shell_are_present(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -1038,6 +1533,63 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertIn("What needs attention", markdown)
             self.assertIn("Review available", markdown)
             self.assertIn("Recent accounts", markdown)
+
+    def test_admin_can_start_a_partner_chat_with_a_selected_character(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        created_payloads: list[dict[str, object]] = []
+
+        def start_chat_request(method: str, url: str, **kwargs: object) -> StubResponse:
+            if method == "GET" and url.endswith("/admin/catalog/personas"):
+                return StubResponse([{**item, "id": index + 1, "active": 1} for index, item in enumerate(CATALOG["personas"])])
+            if method == "GET" and url.endswith("/admin/catalog/scenarios"):
+                return StubResponse([{**item, "id": index + 1, "active": 1} for index, item in enumerate(CATALOG["scenarios"])])
+            if method == "POST" and url.endswith("/admin/sessions"):
+                created_payloads.append(dict(kwargs.get("json") or {}))
+                return StubResponse(
+                    {
+                        "session_id": "admin_new_partner_123",
+                        "message_id": 777,
+                        "user_id": ADMIN_USER["id"],
+                        "mode": "partner",
+                        "persona": "crush",
+                    },
+                    201,
+                )
+            return fake_request(method, url, **kwargs)
+
+        with patch("requests.request", side_effect=start_chat_request):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.query_params["admin"] = "1"
+            app.query_params["admin_view"] = "Conversations"
+            app.run()
+            app.session_state["admin_key"] = "test-admin-key"
+            app.run()
+
+            self.assertTrue(any(item.label == "Start a new chat" for item in app.expander))
+            app.radio(key="admin_new_chat_mode").set_value("Partner").run()
+
+            self.assertEqual(app.selectbox(key="admin_new_chat_persona").value, "husband")
+            app.selectbox(key="admin_new_chat_persona").set_value("crush").run()
+            app.text_area(key="admin_new_chat_character_details").set_value(
+                "His name is Ayaan and he uses dry humour."
+            )
+            app.text_area(key="admin_new_chat_opening_message").set_value(
+                "I was hoping you would message me tonight."
+            )
+            next(
+                item
+                for item in app.button
+                if item.label == "Start chat and send message"
+            ).click().run()
+
+            self.assertEqual(len(created_payloads), 1)
+            self.assertEqual(created_payloads[0]["user_id"], ADMIN_USER["id"])
+            self.assertEqual(created_payloads[0]["mode"], "partner")
+            self.assertEqual(created_payloads[0]["persona"], "crush")
+            self.assertEqual(
+                created_payloads[0]["opening_message"],
+                "I was hoping you would message me tonight.",
+            )
 
     def test_admin_app_usage_shows_installations_and_message_sources(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -1189,7 +1741,7 @@ class DilSeStreamlitTests(unittest.TestCase):
             )
             self.assertFalse(composer.disabled)
             roman_urdu_check = next(
-                item for item in app.toggle if item.label == "Check Roman Urdu"
+                item for item in app.toggle if item.label == "Roman Urdu"
             )
             self.assertTrue(roman_urdu_check.value)
             composer.input("Please review https://www.baatdilse.com/resources")
@@ -1197,7 +1749,7 @@ class DilSeStreamlitTests(unittest.TestCase):
                 key=(
                     "FormSubmitter:"
                     f"admin_chat_composer_form_{ADMIN_SESSION['session_id']}_0"
-                    "-Review before sending"
+                    "-Review words"
                 )
             ).click().run()
 
@@ -1240,6 +1792,68 @@ class DilSeStreamlitTests(unittest.TestCase):
                 "corrected",
             )
 
+    def test_admin_composer_offers_text_and_voice_delivery_modes(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'else ["Text", "Text + audio", "Audio only"]',
+            source,
+        )
+        self.assertIn('options=["Type", "Record"]', source)
+        self.assertIn('st.audio_input(', source)
+        self.assertIn('"draft_source": draft_source', source)
+        self.assertIn('"recording_base64": base64.b64encode(recording_bytes)', source)
+        self.assertIn(
+            'f"/admin/sessions/{selected_session_id}/voice-transcription"',
+            source,
+        )
+        self.assertIn('["Natural", "Seductive"]', source)
+        self.assertNotIn('if latest_mode == "partner"', source)
+        self.assertIn(
+            'Choose the Troy delivery style for this {latest_mode.title()} reply.',
+            source,
+        )
+        self.assertIn('"delivery_mode": delivery_mode', source)
+        self.assertIn('"voice_style": voice_style', source)
+        self.assertIn('with st.spinner("Creating a private voice preview…"):', source)
+        self.assertIn("Hear before sending", source)
+        self.assertIn('"Send this audio"', source)
+        self.assertIn('f"/admin/sessions/{session_id}/voice-preview"', source)
+        self.assertIn(
+            'content == "Voice note" and message.get("voice_note_id")',
+            source,
+        )
+
+    def test_admin_record_source_reveals_recorder_immediately(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        with patch.dict(ADMIN_DETAIL["session_control"], {"mode": "human"}), patch(
+            "requests.request", side_effect=fake_request
+        ):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.query_params["admin"] = "1"
+            app.run()
+            app.session_state["admin_key"] = "test-admin-key"
+            app.session_state["admin_page"] = "Conversations"
+            app.session_state["admin_selected_user_id"] = ADMIN_USER["id"]
+            app.session_state["admin_selected_session_id"] = ADMIN_SESSION["session_id"]
+            app.run()
+
+            draft_source = next(item for item in app.radio if item.label == "Draft with")
+            draft_source.set_value("Record").run()
+
+            self.assertTrue(
+                any(
+                    getattr(item, "label", None) == "Record voice draft"
+                    for item in app.get("audio_input")
+                )
+            )
+            delivery = next(item for item in app.radio if item.label == "Send as")
+            self.assertEqual(delivery.options, ["Text + audio", "Audio only"])
+            self.assertFalse(
+                any(item.label == "Administrator message" for item in app.text_area)
+            )
+
     def test_admin_can_send_without_roman_urdu_review(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
 
@@ -1270,7 +1884,7 @@ class DilSeStreamlitTests(unittest.TestCase):
                 key=(
                     "FormSubmitter:"
                     f"admin_chat_composer_form_{ADMIN_SESSION['session_id']}_0"
-                    "-Send without review"
+                    "-Send now"
                 )
             ).click().run()
 
@@ -1293,6 +1907,98 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertEqual(
                 send_call.kwargs["json"]["roman_urdu_review_status"],
                 "not_checked",
+            )
+            self.assertEqual(app.session_state["admin_page"], "Conversations")
+            self.assertEqual(
+                app.session_state["admin_selected_session_id"],
+                ADMIN_SESSION["session_id"],
+            )
+            self.assertEqual(
+                app.session_state["admin_mobile_page_picker"],
+                "Conversations",
+            )
+            app.run()
+            self.assertEqual(app.session_state["admin_page"], "Conversations")
+
+    def test_admin_hears_the_exact_voice_preview_before_sending(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        preview_audio = base64.b64encode(b"RIFFpreviewWAVE").decode("ascii")
+
+        def preview_request(method: str, url: str, **kwargs: object) -> StubResponse:
+            if method == "POST" and url.endswith(
+                f"/admin/sessions/{ADMIN_SESSION['session_id']}/voice-preview"
+            ):
+                return StubResponse(
+                    {
+                        "transcript": kwargs["json"]["content"],
+                        "audio_base64": preview_audio,
+                        "audio_mime_type": "audio/wav",
+                        "audio_filename": "dilse-troy-natural-preview.wav",
+                        "duration_seconds": 1.2,
+                        "voice_style": "conversational",
+                    }
+                )
+            if method == "POST" and url.endswith(
+                f"/admin/sessions/{ADMIN_SESSION['session_id']}/messages"
+            ):
+                return StubResponse(
+                    {"id": 3, "attachment_id": None, "voice_note_id": 1},
+                    201,
+                )
+            return fake_request(method, url, **kwargs)
+
+        with patch.dict(ADMIN_DETAIL["session_control"], {"mode": "human"}), patch(
+            "requests.request", side_effect=preview_request
+        ) as request_mock:
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.query_params["admin"] = "1"
+            app.run()
+            app.session_state["admin_key"] = "test-admin-key"
+            app.session_state["admin_page"] = "Conversations"
+            app.session_state["admin_selected_user_id"] = ADMIN_USER["id"]
+            app.session_state["admin_selected_session_id"] = ADMIN_SESSION["session_id"]
+            app.run()
+
+            delivery = next(item for item in app.radio if item.label == "Send as")
+            delivery.set_value("Text + audio").run()
+            voice_style = next(item for item in app.radio if item.label == "Voice style")
+            self.assertEqual(voice_style.options, ["Natural", "Seductive"])
+            composer = next(
+                item for item in app.text_area if item.label == "Administrator message"
+            )
+            composer.input("Aap araam se batayein.")
+            app.button(
+                key=(
+                    "FormSubmitter:"
+                    f"admin_chat_composer_form_{ADMIN_SESSION['session_id']}_0"
+                    "-Make voice preview"
+                )
+            ).click().run()
+
+            preview_buttons = {item.label for item in app.button}
+            self.assertIn("Send this audio", preview_buttons)
+            self.assertIn("Regenerate", preview_buttons)
+            self.assertIn("Edit", preview_buttons)
+            self.assertEqual(
+                [
+                    call
+                    for call in request_mock.call_args_list
+                    if call.args[0] == "POST" and call.args[1].endswith("/messages")
+                ],
+                [],
+            )
+            app.button(
+                key=f"admin_send_voice_preview_{ADMIN_SESSION['session_id']}"
+            ).click().run()
+
+            send_call = next(
+                call
+                for call in request_mock.call_args_list
+                if call.args[0] == "POST" and call.args[1].endswith("/messages")
+            )
+            self.assertEqual(
+                send_call.kwargs["json"]["voice_preview_base64"],
+                preview_audio,
             )
 
     def test_admin_audit_includes_private_message_revision_history(self) -> None:

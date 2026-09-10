@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>DilSe compatibility component</title>
+  <style>html, body { margin: 0; width: 0; height: 0; overflow: hidden; }</style>
+</head>
+<body>
+<script>
+(function () {
+  function post(type, extra) {
+    var message = { isStreamlitMessage: true, type: type };
+    var key;
+    extra = extra || {};
+    for (key in extra) {
+      if (Object.prototype.hasOwnProperty.call(extra, key)) {
+        message[key] = extra[key];
+      }
+    }
+    window.parent.postMessage(message, "*");
+  }
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 0 });
+  window.addEventListener("message", function (event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    post("streamlit:setFrameHeight", { height: 0 });
+  });
+})();
+</script>
+</body>
+</html>

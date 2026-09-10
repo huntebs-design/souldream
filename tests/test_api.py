@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 import wave
 from datetime import datetime, timedelta, timezone
@@ -66,7 +68,61 @@ def wav_recording_with_quiet_pause(frame_rate: int = 8_000) -> bytes:
 
 
 class DilSeApiTests(unittest.TestCase):
+    def test_waitlist_cannot_be_bypassed_by_omitting_time_preference(self) -> None:
+        self.client.put("/admin/access-settings", headers=self.admin_headers,
+                        json={"require_approval_for_new_accounts": True})
+        response = self.client.post("/auth/register", json={
+            "email": "no-slot@example.com", "password": "long-test-password",
+            "display_name": "No slot", "language": "English", "country": "Pakistan",
+            "terms_accepted": True,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["user"]["access_status"], "pending")
+        self.assertEqual(response.json()["user"]["preferred_time_slot"], "flexible")
+        headers = {"X-User-Token": response.json()["token"]}
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200)
+        for path in ("/catalog", "/sessions", "/sessions/unread"):
+            self.assertEqual(self.client.get(path, headers=headers).status_code, 403)
+        # Enabling approval leaves existing active accounts active.
+        self.assertEqual(self.client.get("/auth/me", headers=self.user_headers).json()["access_status"], "active")
+        user_id = response.json()["user"]["id"]
+        with patch("main.send_account_activation_email", side_effect=RuntimeError("mail unavailable")):
+            activated = self.client.post(f"/admin/users/{user_id}/approve", headers=self.admin_headers,
+                                         json={"default_response_mode": "ai"})
+        self.assertEqual(activated.status_code, 200)
+        self.assertFalse(activated.json()["email_sent"])
+        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["access_status"], "active")
+        self.assertEqual(self.client.get("/catalog", headers=headers).status_code, 200)
+
+
+    def test_expired_user_token_cannot_read_sessions(self) -> None:
+        with main.get_connection() as connection:
+            connection.execute("UPDATE auth_sessions SET expires_at = '2000-01-01T00:00:00+00:00'")
+            connection.commit()
+        self.assertEqual(self.client.get("/sessions", headers=self.user_headers).status_code, 401)
+
+    def test_deleted_account_cannot_login_or_restore_browser_session(self) -> None:
+        browser_id = "disposable-fixture-browser-1234567890"
+        self.assertEqual(self.client.post("/auth/browser-session", headers=self.user_headers, json={"browser_id": browser_id}).status_code, 204)
+        with patch.object(main, "send_account_deletion_confirmation_email", return_value="fixture-mail"):
+            self.assertEqual(self.client.request("DELETE", "/account", headers=self.user_headers, json={"password": "long-test-password"}).status_code, 204)
+        self.assertEqual(self.client.get("/auth/me", headers=self.user_headers).status_code, 401)
+        self.assertEqual(self.client.post("/auth/login", json={"email": "tester@example.com", "password": "long-test-password"}).status_code, 401)
+        self.assertEqual(self.client.post("/auth/browser-session/restore", headers={"X-Browser-Session": browser_id}).status_code, 401)
+
+    def test_image_signature_alone_does_not_make_a_valid_attachment(self) -> None:
+        with self.assertRaises(main.HTTPException) as error:
+            main.decode_admin_image(base64.b64encode(b"\x89PNG\r\n\x1a\ninvalid").decode(), "image/png")
+        self.assertEqual(error.exception.status_code, 422)
+
+    def test_truncated_generated_audio_is_rejected_before_preview(self) -> None:
+        with self.assertRaises(main.HTTPException) as error:
+            main.merge_admin_tts_wav([wav_recording()[:-100]])
+        self.assertEqual(error.exception.status_code, 502)
+
     def setUp(self) -> None:
+        with main._RATE_LIMIT_LOCK:
+            main._RATE_LIMIT_BUCKETS.clear()
         self.temporary_directory = tempfile.TemporaryDirectory()
         main.DATABASE_PATH = Path(self.temporary_directory.name) / "test.db"
         main.AsyncGroq = FakeGroq
@@ -77,6 +133,13 @@ class DilSeApiTests(unittest.TestCase):
         FakeCompletions.responses = []
         self.client_context = TestClient(main.app)
         self.client = self.client_context.__enter__()
+        with main.get_connection() as connection:
+            main.set_app_setting(
+                connection,
+                main.NEW_ACCOUNT_APPROVAL_SETTING,
+                "0",
+            )
+            connection.commit()
         response = self.client.post(
             "/auth/register",
             json={
@@ -96,6 +159,133 @@ class DilSeApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temporary_directory.cleanup()
 
+    def test_api_schema_and_documentation_are_not_public(self) -> None:
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404, response.text)
+
+    def test_sensitive_routes_keep_an_authentication_dependency(self) -> None:
+        from fastapi.routing import APIRoute
+
+        def dependency_calls(dependant: object) -> set[object]:
+            calls: set[object] = set()
+            for dependency in getattr(dependant, "dependencies", []):
+                if dependency.call:
+                    calls.add(dependency.call)
+                calls.update(dependency_calls(dependency))
+            return calls
+
+        user_prefixes = (
+            "/account",
+            "/catalog",
+            "/chat",
+            "/sessions",
+            "/messages",
+            "/usage",
+            "/roleplay",
+        )
+        manual_admin_routes = {
+            "/admin/browser-session/restore",
+            "/admin/browser-session",
+        }
+        for route in main.app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            calls = dependency_calls(route.dependant)
+            with self.subTest(path=route.path):
+                if route.path.startswith("/admin") and route.path not in manual_admin_routes:
+                    self.assertIn(main.require_admin_key, calls)
+                if route.path.startswith(user_prefixes):
+                    self.assertTrue(
+                        {main.require_user, main.require_current_terms} & calls,
+                        route.path,
+                    )
+
+    def test_api_adds_security_headers_and_rejects_oversized_bodies(self) -> None:
+        response = self.client.get("/health")
+        self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+
+        response = self.client.post(
+            "/auth/login",
+            content=b"",
+            headers={"Content-Length": str(main.MAX_API_REQUEST_BYTES + 1)},
+        )
+        self.assertEqual(response.status_code, 413, response.text)
+
+    def test_repeated_failed_logins_are_rate_limited(self) -> None:
+        for _ in range(12):
+            response = self.client.post(
+                "/auth/login",
+                json={"email": "tester@example.com", "password": "wrong-password"},
+            )
+            self.assertEqual(response.status_code, 401, response.text)
+        blocked = self.client.post(
+            "/auth/login",
+            json={"email": "tester@example.com", "password": "wrong-password"},
+        )
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("retry-after", blocked.headers)
+
+    def test_auth_password_inputs_are_bounded_before_hashing(self) -> None:
+        response = self.client.post(
+            "/auth/login",
+            json={"email": "tester@example.com", "password": "x" * 201},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_user_chat_response_hides_internal_model_and_token_metadata(self) -> None:
+        response = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "public_response_metadata_123",
+                "message": "I want to talk.",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("model", response.json())
+        self.assertNotIn("prompt_tokens", response.json())
+        self.assertNotIn("completion_tokens", response.json())
+
+    def test_conversation_id_cannot_be_claimed_by_another_user(self) -> None:
+        with main.get_connection() as connection:
+            connection.execute(
+                "UPDATE users SET default_human_control = 1 WHERE email = ?",
+                ("tester@example.com",),
+            )
+            connection.commit()
+        session_id = "globally_owned_session_123"
+        first = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={"session_id": session_id, "message": "First account message"},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+
+        second_registration = self.client.post(
+            "/auth/register",
+            json={
+                "email": "second@example.com",
+                "password": "another-long-password",
+                "display_name": "Second",
+                "language": "English",
+                "country": "Pakistan",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(second_registration.status_code, 201, second_registration.text)
+        second_headers = {"X-User-Token": second_registration.json()["token"]}
+        collision = self.client.post(
+            "/chat",
+            headers=second_headers,
+            json={"session_id": session_id, "message": "Second account message"},
+        )
+        self.assertEqual(collision.status_code, 409, collision.text)
+
     def test_mobile_release_metadata_points_to_the_first_party_apk(self) -> None:
         response = self.client.get("/mobile/version")
         self.assertEqual(response.status_code, 200, response.text)
@@ -107,6 +297,286 @@ class DilSeApiTests(unittest.TestCase):
             payload["download_url"],
             "https://www.baatdilse.com/downloads/DilSe-latest.apk",
         )
+
+    def test_long_transcripts_are_paged_and_live_checks_stay_small(self) -> None:
+        session_id = "performance_session_123"
+        with main.get_connection() as connection:
+            user_id = int(
+                connection.execute(
+                    "SELECT id FROM users WHERE email = 'tester@example.com'"
+                ).fetchone()[0]
+            )
+            connection.executemany(
+                """INSERT INTO messages
+                   (session_id, role, content, mode, created_at, user_id,
+                    source, client_platform)
+                   VALUES (?, ?, ?, 'listener', ?, ?, ?, 'web')""",
+                [
+                    (
+                        session_id,
+                        "user" if index % 2 else "assistant",
+                        f"Performance message {index}",
+                        f"2026-09-03T12:{index // 60:02d}:{index % 60:02d}+00:00",
+                        user_id,
+                        "user" if index % 2 else "ai",
+                    )
+                    for index in range(1, 126)
+                ],
+            )
+            connection.commit()
+
+        recent = self.client.get(
+            f"/sessions/{session_id}/messages",
+            headers=self.user_headers,
+        )
+        self.assertEqual(recent.status_code, 200, recent.text)
+        self.assertEqual(len(recent.json()), 30)
+        self.assertEqual(recent.json()[0]["content"], "Performance message 96")
+        self.assertEqual(recent.json()[-1]["content"], "Performance message 125")
+
+        earlier = self.client.get(
+            f"/sessions/{session_id}/messages?limit=30&before_id={recent.json()[0]['id']}",
+            headers=self.user_headers,
+        )
+        self.assertEqual(earlier.status_code, 200, earlier.text)
+        self.assertEqual(len(earlier.json()), 30)
+        self.assertEqual(earlier.json()[0]["content"], "Performance message 66")
+        self.assertEqual(earlier.json()[-1]["content"], "Performance message 95")
+
+        expanded = self.client.get(
+            f"/sessions/{session_id}/messages?limit=120",
+            headers=self.user_headers,
+        )
+        self.assertEqual(len(expanded.json()), 120)
+        self.assertEqual(expanded.json()[0]["content"], "Performance message 6")
+
+        latest_id = int(recent.json()[-1]["id"])
+        unchanged = self.client.get(
+            f"/sessions/{session_id}/sync?after_id={latest_id}&known_count=125",
+            headers=self.user_headers,
+        )
+        self.assertEqual(unchanged.status_code, 200, unchanged.text)
+        self.assertEqual(unchanged.json()["message_count"], 125)
+        self.assertIsNone(unchanged.json()["message_ids"])
+        self.assertEqual(unchanged.json()["updates"], [])
+
+        changed = self.client.get(
+            f"/sessions/{session_id}/sync?after_id={latest_id}&known_count=124",
+            headers=self.user_headers,
+        )
+        self.assertEqual(len(changed.json()["message_ids"]), 125)
+
+        detail = self.client.get(
+            f"/admin/sessions/{session_id}/detail",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["message_count"], 125)
+        self.assertEqual(len(detail.json()["messages"]), 30)
+        self.assertEqual(detail.json()["messages"][0]["content"], "Performance message 96")
+
+        admin_earlier = self.client.get(
+            f"/admin/sessions/{session_id}/detail?record_view=false&message_limit=30"
+            f"&before_id={detail.json()['messages'][0]['id']}",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(admin_earlier.status_code, 200, admin_earlier.text)
+        self.assertEqual(len(admin_earlier.json()["messages"]), 30)
+        self.assertEqual(
+            admin_earlier.json()["messages"][0]["content"],
+            "Performance message 66",
+        )
+        self.assertEqual(
+            admin_earlier.json()["messages"][-1]["content"],
+            "Performance message 95",
+        )
+
+        status = self.client.get(
+            f"/admin/sessions/{session_id}/status",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["message_count"], 125)
+        self.assertEqual(
+            status.json()["transcript_revision"],
+            detail.json()["transcript_revision"],
+        )
+        self.assertNotIn("messages", status.json())
+
+        user_live = self.client.get(
+            f"/sessions/{session_id}/live?revision=124:0&timeout_seconds=1",
+            headers=self.user_headers,
+        )
+        self.assertEqual(user_live.status_code, 200, user_live.text)
+        self.assertTrue(user_live.json()["changed"])
+        self.assertEqual(user_live.json()["revision"], f"125:{latest_id}")
+
+        admin_live = self.client.get(
+            f"/admin/sessions/{session_id}/live?revision=stale&timeout_seconds=1",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(admin_live.status_code, 200, admin_live.text)
+        self.assertTrue(admin_live.json()["changed"])
+        self.assertEqual(
+            admin_live.json()["revision"],
+            status.json()["transcript_revision"],
+        )
+
+        async def measure_live_wakeup() -> tuple[dict[str, object], float]:
+            with main.get_connection() as connection:
+                user = connection.execute(
+                    "SELECT * FROM users WHERE email = 'tester@example.com'"
+                ).fetchone()
+
+            async def add_message() -> None:
+                await asyncio.sleep(0.1)
+                with main.get_connection() as connection:
+                    connection.execute(
+                        """INSERT INTO messages
+                           (session_id, role, content, mode, created_at, user_id,
+                            source, client_platform)
+                           VALUES (?, 'assistant', ?, 'listener', ?, ?, 'admin', 'web')""",
+                        (
+                            session_id,
+                            "A message that wakes the live channel.",
+                            "2026-09-03T13:00:00+00:00",
+                            int(user["id"]),
+                        ),
+                    )
+                    connection.commit()
+
+            started_at = time.monotonic()
+            waiter, _ = await asyncio.gather(
+                main.wait_for_user_session_change(
+                    session_id,
+                    f"125:{latest_id}",
+                    1,
+                    user,
+                ),
+                add_message(),
+            )
+            return waiter, time.monotonic() - started_at
+
+        wakeup, elapsed = asyncio.run(measure_live_wakeup())
+        self.assertTrue(wakeup["changed"])
+        self.assertTrue(str(wakeup["revision"]).startswith("126:"))
+        self.assertLess(elapsed, 0.8)
+
+    def test_user_unread_inbox_clears_when_the_reply_is_opened(self) -> None:
+        session_id = "user_unread_badge_123"
+        now = datetime.now(timezone.utc)
+        with main.get_connection() as connection:
+            user_id = int(
+                connection.execute(
+                    "SELECT id FROM users WHERE email = 'tester@example.com'"
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """INSERT INTO messages
+                   (session_id, role, content, mode, created_at, user_id,
+                    source, client_platform)
+                   VALUES (?, 'user', ?, 'listener', ?, ?, 'user', 'web')""",
+                (
+                    session_id,
+                    "I need help with a conversation.",
+                    now.isoformat(),
+                    user_id,
+                ),
+            )
+            reply = connection.execute(
+                """INSERT INTO messages
+                   (session_id, role, content, mode, created_at, user_id,
+                    source, client_platform)
+                   VALUES (?, 'assistant', ?, 'listener', ?, ?, 'human', 'web')""",
+                (
+                    session_id,
+                    "Your new DilSe reply is ready.",
+                    (now + timedelta(seconds=1)).isoformat(),
+                    user_id,
+                ),
+            )
+            reply_id = int(reply.lastrowid)
+            connection.commit()
+
+        unread = self.client.get("/sessions/unread", headers=self.user_headers)
+        self.assertEqual(unread.status_code, 200, unread.text)
+        self.assertEqual(unread.json()["total_unread"], 1)
+        self.assertEqual(unread.json()["conversations"][0]["session_id"], session_id)
+        self.assertEqual(
+            unread.json()["conversations"][0]["latest_message_preview"],
+            "Your new DilSe reply is ready.",
+        )
+
+        sessions = self.client.get("/sessions", headers=self.user_headers)
+        saved = next(
+            item for item in sessions.json() if item["session_id"] == session_id
+        )
+        self.assertEqual(saved["unread_count"], 1)
+
+        receipt = self.client.post(
+            f"/sessions/{session_id}/read",
+            headers=self.user_headers,
+            json={"message_ids": [reply_id]},
+        )
+        self.assertEqual(receipt.status_code, 200, receipt.text)
+        cleared = self.client.get("/sessions/unread", headers=self.user_headers)
+        self.assertEqual(cleared.json(), {"total_unread": 0, "conversations": []})
+
+    def test_admin_inbox_groups_new_user_messages_and_opens_the_chat(self) -> None:
+        session_id = "admin_inbox_badge_123"
+        now = datetime.now(timezone.utc)
+        with main.get_connection() as connection:
+            user_id = int(
+                connection.execute(
+                    "SELECT id FROM users WHERE email = 'tester@example.com'"
+                ).fetchone()[0]
+            )
+            connection.executemany(
+                """INSERT INTO messages
+                   (session_id, role, content, mode, created_at, user_id,
+                    source, client_platform)
+                   VALUES (?, 'user', ?, 'partner', ?, ?, 'user', 'web')""",
+                [
+                    (
+                        session_id,
+                        "Are you there?",
+                        now.isoformat(),
+                        user_id,
+                    ),
+                    (
+                        session_id,
+                        "I sent another message.",
+                        (now + timedelta(seconds=1)).isoformat(),
+                        user_id,
+                    ),
+                ],
+            )
+            connection.commit()
+
+        inbox = self.client.get("/admin/inbox", headers=self.admin_headers)
+        self.assertEqual(inbox.status_code, 200, inbox.text)
+        self.assertEqual(inbox.json()["total_unread"], 2)
+        self.assertEqual(len(inbox.json()["conversations"]), 1)
+        conversation = inbox.json()["conversations"][0]
+        self.assertEqual(conversation["session_id"], session_id)
+        self.assertEqual(conversation["unread_count"], 2)
+        self.assertEqual(conversation["latest_message_preview"], "I sent another message.")
+
+        background_load = self.client.get(
+            f"/admin/sessions/{session_id}/detail?record_view=false",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(background_load.status_code, 200, background_load.text)
+        still_unread = self.client.get("/admin/inbox", headers=self.admin_headers)
+        self.assertEqual(still_unread.json()["total_unread"], 2)
+
+        opened = self.client.get(
+            f"/admin/sessions/{session_id}/detail",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(opened.status_code, 200, opened.text)
+        cleared = self.client.get("/admin/inbox", headers=self.admin_headers)
+        self.assertEqual(cleared.json(), {"total_unread": 0, "conversations": []})
 
     def test_browser_session_restores_login_after_streamlit_refresh(self) -> None:
         browser_id = "browser_session_test_" + ("a" * 40)
@@ -273,6 +743,88 @@ class DilSeApiTests(unittest.TestCase):
                 0,
             )
 
+    def test_admin_can_block_and_unblock_an_exact_ip_address(self) -> None:
+        tracker_headers = {"X-Visitor-Tracking-Key": "test-visitor-tracking-secret"}
+        ip_address = "2001:0db8:0000:0000:0000:0000:0000:0042"
+
+        unauthorized = self.client.post(
+            "/admin/ip-blocks",
+            json={"ip_address": ip_address, "note": "Repeated unwanted requests"},
+        )
+        self.assertEqual(unauthorized.status_code, 401, unauthorized.text)
+
+        invalid = self.client.post(
+            "/admin/ip-blocks",
+            headers=self.admin_headers,
+            json={"ip_address": "not-an-ip", "note": "Invalid test"},
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+
+        created = self.client.post(
+            "/admin/ip-blocks",
+            headers=self.admin_headers,
+            json={"ip_address": ip_address, "note": "Repeated unwanted requests"},
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        block = created.json()
+        self.assertEqual(block["ip_address"], "2001:db8::42")
+        self.assertEqual(block["note"], "Repeated unwanted requests")
+
+        duplicate = self.client.post(
+            "/admin/ip-blocks",
+            headers=self.admin_headers,
+            json={"ip_address": "2001:db8::42", "note": "Duplicate"},
+        )
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+
+        access = self.client.post(
+            "/visitor/access-check",
+            headers=tracker_headers,
+            json={"ip_address": "2001:db8::42"},
+        )
+        self.assertEqual(access.status_code, 200, access.text)
+        self.assertTrue(access.json()["blocked"])
+        self.assertEqual(
+            self.client.post(
+                "/visitor/access-check", json={"ip_address": "2001:db8::42"}
+            ).status_code,
+            401,
+        )
+
+        heartbeat = self.client.post(
+            "/visitor/heartbeat",
+            headers=tracker_headers,
+            json={
+                "browser_id": "blocked_visitor_" + ("b" * 48),
+                "ip_address": "2001:db8::42",
+                "page": "Home",
+            },
+        )
+        self.assertEqual(heartbeat.status_code, 403, heartbeat.text)
+
+        blocks = self.client.get("/admin/ip-blocks", headers=self.admin_headers)
+        self.assertEqual(blocks.status_code, 200, blocks.text)
+        self.assertEqual([item["id"] for item in blocks.json()], [block["id"]])
+        summary = self.client.get("/admin/summary", headers=self.admin_headers)
+        self.assertEqual(summary.json()["blocked_ips"], 1)
+
+        removed = self.client.delete(
+            f"/admin/ip-blocks/{block['id']}", headers=self.admin_headers
+        )
+        self.assertEqual(removed.status_code, 204, removed.text)
+        allowed = self.client.post(
+            "/visitor/access-check",
+            headers=tracker_headers,
+            json={"ip_address": "2001:db8::42"},
+        )
+        self.assertFalse(allowed.json()["blocked"])
+        self.assertEqual(
+            self.client.delete(
+                f"/admin/ip-blocks/{block['id']}", headers=self.admin_headers
+            ).status_code,
+            404,
+        )
+
     def test_prompt_modules_stay_scoped_and_within_budget(self) -> None:
         listener_request = main.ChatRequest(
             session_id="prompt_budget_123",
@@ -393,13 +945,15 @@ class DilSeApiTests(unittest.TestCase):
         self.assertEqual(invalid_country.status_code, 422)
         catalog = self.client.get("/catalog", headers=self.user_headers)
         self.assertEqual(catalog.status_code, 200)
-        self.assertEqual(len(catalog.json()["personas"]), 7)
+        self.assertEqual(len(catalog.json()["personas"]), 9)
         self.assertEqual(len(catalog.json()["scenarios"]), 9)
         self.assertEqual(len(catalog.json()["exercises"]), 9)
         self.assertEqual(len(catalog.json()["cards"]), 11)
 
         self.assertTrue(any(item["slug"] == "money_and_career" for item in catalog.json()["scenarios"]))
         self.assertTrue(any(item["slug"] == "trust_request" for item in catalog.json()["exercises"]))
+        self.assertTrue(any(item["slug"] == "crush" for item in catalog.json()["personas"]))
+        self.assertTrue(any(item["slug"] == "fantasy_partner" for item in catalog.json()["personas"]))
         privacy = self.client.put(
             "/account/privacy",
             headers=self.user_headers,
@@ -449,6 +1003,137 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(notifications_off.status_code, 200, notifications_off.text)
         self.assertFalse(notifications_off.json()["email_notifications_enabled"])
+
+    def test_new_accounts_wait_for_activation_and_admin_selects_reply_mode(self) -> None:
+        unauthorized = self.client.get("/admin/access-settings")
+        self.assertEqual(unauthorized.status_code, 401, unauthorized.text)
+
+        enabled = self.client.put(
+            "/admin/access-settings",
+            headers=self.admin_headers,
+            json={"require_approval_for_new_accounts": True},
+        )
+        self.assertEqual(enabled.status_code, 200, enabled.text)
+        self.assertTrue(enabled.json()["require_approval_for_new_accounts"])
+
+        registration = self.client.post(
+            "/auth/register",
+            json={
+                "email": "waitlist@example.com",
+                "password": "long-test-password",
+                "display_name": "Waitlist User",
+                "language": "Roman Urdu",
+                "country": "Pakistan",
+                "preferred_time_slot": "evening",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(registration.status_code, 201, registration.text)
+        waiting_user = registration.json()["user"]
+        self.assertEqual(waiting_user["access_status"], "pending")
+        self.assertEqual(waiting_user["preferred_time_slot"], "evening")
+        waiting_headers = {"X-User-Token": registration.json()["token"]}
+
+        blocked = self.client.post(
+            "/chat",
+            headers=waiting_headers,
+            json={
+                "session_id": "waiting_access_123",
+                "message": "Can I start now?",
+                "mode": "listener",
+            },
+        )
+        self.assertEqual(blocked.status_code, 403, blocked.text)
+        self.assertIn("waitlist", blocked.json()["detail"].lower())
+
+        users = self.client.get("/admin/users", headers=self.admin_headers)
+        self.assertEqual(users.status_code, 200, users.text)
+        pending = next(
+            item for item in users.json() if item["email"] == "waitlist@example.com"
+        )
+        self.assertEqual(pending["access_status"], "pending")
+        self.assertEqual(pending["preferred_time_slot"], "evening")
+        summary = self.client.get("/admin/summary", headers=self.admin_headers)
+        self.assertEqual(summary.json()["pending_access_users"], 1)
+
+        with patch("main.send_account_activation_email", return_value="email-123") as send_email:
+            activated = self.client.post(
+                f"/admin/users/{pending['id']}/approve",
+                headers=self.admin_headers,
+                json={"default_response_mode": "human"},
+            )
+        self.assertEqual(activated.status_code, 200, activated.text)
+        self.assertEqual(activated.json()["status"], "active")
+        self.assertEqual(activated.json()["default_response_mode"], "human")
+        self.assertTrue(activated.json()["email_sent"])
+        send_email.assert_called_once_with(
+            "waitlist@example.com", "Waitlist User", "evening"
+        )
+
+        refreshed = self.client.get("/auth/me", headers=waiting_headers)
+        self.assertEqual(refreshed.json()["access_status"], "active")
+        waiting_for_human = self.client.post(
+            "/chat",
+            headers=waiting_headers,
+            json={
+                "session_id": "activated_human_123",
+                "message": "I am ready to talk.",
+                "mode": "listener",
+            },
+        )
+        self.assertEqual(waiting_for_human.status_code, 200, waiting_for_human.text)
+        self.assertEqual(waiting_for_human.json()["delivery"], "waiting_for_admin")
+
+        with patch("main.send_account_activation_email") as repeated_email:
+            repeated = self.client.post(
+                f"/admin/users/{pending['id']}/approve",
+                headers=self.admin_headers,
+                json={"default_response_mode": "ai"},
+            )
+        self.assertTrue(repeated.json()["already_active"])
+        repeated_email.assert_not_called()
+
+        disabled = self.client.put(
+            "/admin/access-settings",
+            headers=self.admin_headers,
+            json={"require_approval_for_new_accounts": False},
+        )
+        self.assertFalse(disabled.json()["require_approval_for_new_accounts"])
+        immediate = self.client.post(
+            "/auth/register",
+            json={
+                "email": "immediate@example.com",
+                "password": "long-test-password",
+                "display_name": "Immediate User",
+                "language": "English",
+                "country": "Pakistan",
+                "preferred_time_slot": "flexible",
+                "terms_accepted": True,
+            },
+        )
+        self.assertEqual(immediate.json()["user"]["access_status"], "active")
+
+    def test_account_activation_email_contains_no_conversation_content(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "RESEND_API_KEY": "resend-test",
+                "EMAIL_FROM": "DilSe <hello@example.com>",
+                "PUBLIC_APP_URL": "https://www.baatdilse.com/app/",
+            },
+        ), patch("main.requests.post") as post:
+            post.return_value.json.return_value = {"id": "email-activation-1"}
+            main.send_account_activation_email(
+                "new@example.com",
+                "Ayesha",
+                "evening",
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["subject"], "Your DilSe account is active")
+        self.assertIn("6:00 PM to 10:00 PM PKT", payload["text"])
+        self.assertIn("sign in and start a conversation", payload["text"])
+        self.assertNotIn("admin", payload["text"].lower())
 
     def test_experience_v2_is_assigned_only_to_new_accounts(self) -> None:
         account = self.client.get("/auth/me", headers=self.user_headers)
@@ -635,6 +1320,49 @@ class DilSeApiTests(unittest.TestCase):
             0,
         )
         self.assertEqual(len(deliveries), 1)
+
+    def test_account_deletion_email_states_its_scope_and_selected_reason(self) -> None:
+        provider_response = SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {"id": "deletion-email-id"},
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "RESEND_API_KEY": "test-resend-key",
+                "EMAIL_FROM": "DilSe <privacy@example.com>",
+            },
+        ), patch("main.requests.post", return_value=provider_response) as email_request:
+            provider_id = main.send_account_deletion_confirmation_email(
+                "tester@example.com",
+                "Tester Example",
+                "Privacy or trust concerns",
+                "2026-09-05T17:30:00+00:00",
+                "DIL-20260905-ABC123",
+            )
+
+        self.assertEqual(provider_id, "deletion-email-id")
+        email = email_request.call_args.kwargs["json"]
+        self.assertEqual(email["subject"], "Your DilSe account has been deleted")
+        self.assertEqual(email["text"], (
+            "Hi Tester,\n\n"
+            "Your DilSe account has been deleted from the live DilSe service.\n\n"
+            "Your profile, stored conversations, voice notes, consent records, feedback, and active sign-in sessions were removed. You can no longer sign in using this deleted account.\n\n"
+            "Reason for leaving: Privacy or trust concerns\n"
+            "Deletion completed: 2026-09-05T17:30:00+00:00\n"
+            "Confirmation reference: DIL-20260905-ABC123\n\n"
+            "This confirms that your account, conversations, and personal data were removed from the live DilSe service.\n\n"
+            "Regards,\n\nBaat Dilse Team."
+        ))
+        self.assertIn("Reason for leaving:</strong>", email["html"])
+        self.assertIn("Confirmation reference:</strong>", email["html"])
+        self.assertIn(
+            "account, conversations, and personal data were removed from the live DilSe service",
+            email["text"],
+        )
+        self.assertIn("Regards,\n\nBaat Dilse Team.", email["text"])
+        self.assertNotIn("Historical protected backups", email["text"])
+        self.assertNotIn("all data has been removed permanently", email["text"].lower())
 
     def test_unread_admin_response_notifies_after_five_minutes(self) -> None:
         session_id = "admin_email_notice_123"
@@ -1036,6 +1764,463 @@ class DilSeApiTests(unittest.TestCase):
         self.assertEqual(visible.status_code, 200, visible.text)
         self.assertTrue(any(item["session_id"] == "legacy_terms_123" for item in visible.json()))
 
+    def test_admin_can_start_listener_and_partner_conversations_for_a_user(self) -> None:
+        account = self.client.get("/auth/me", headers=self.user_headers).json()
+        listener_opening = "I am checking in. What would you like support with today?"
+        listener = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "listener",
+                "opening_message": listener_opening,
+            },
+        )
+        self.assertEqual(listener.status_code, 201, listener.text)
+        self.assertEqual(listener.json()["mode"], "listener")
+        self.assertIsNone(listener.json()["persona"])
+
+        partner_opening = "I was hoping you would message me tonight."
+        partner = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "partner",
+                "opening_message": partner_opening,
+                "persona": "crush",
+                "scenario": "practice_opening_up",
+                "roleplay_intensity": "romantic",
+                "roleplay_difficulty": "supportive",
+                "character_description": "His name is Ayaan and he uses dry humour.",
+            },
+        )
+        self.assertEqual(partner.status_code, 201, partner.text)
+        self.assertEqual(partner.json()["mode"], "partner")
+        self.assertEqual(partner.json()["persona"], "crush")
+
+        sessions = self.client.get("/sessions", headers=self.user_headers)
+        self.assertEqual(sessions.status_code, 200, sessions.text)
+        partner_session = next(
+            item
+            for item in sessions.json()
+            if item["session_id"] == partner.json()["session_id"]
+        )
+        self.assertEqual(partner_session["first_user_message"], partner_opening)
+        self.assertEqual(partner_session["mode"], "partner")
+        self.assertEqual(partner_session["character"], "crush")
+        self.assertEqual(partner_session["roleplay_intensity"], "romantic")
+        self.assertEqual(partner_session["roleplay_difficulty"], "supportive")
+        self.assertEqual(
+            partner_session["character_description"],
+            "His name is Ayaan and he uses dry humour.",
+        )
+
+        messages = self.client.get(
+            f"/sessions/{partner.json()['session_id']}/messages",
+            headers=self.user_headers,
+        )
+        self.assertEqual(messages.status_code, 200, messages.text)
+        self.assertEqual(messages.json()[0]["role"], "assistant")
+        self.assertEqual(messages.json()[0]["source"], "admin")
+        self.assertEqual(messages.json()[0]["content"], partner_opening)
+
+        detail = self.client.get(
+            f"/admin/sessions/{partner.json()['session_id']}/detail",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["session_control"]["mode"], "human")
+
+        reply = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": partner.json()["session_id"],
+                "message": "I was thinking about you too.",
+                "mode": "partner",
+                "persona": "crush",
+                "scenario": "practice_opening_up",
+                "roleplay_intensity": "romantic",
+                "roleplay_difficulty": "supportive",
+            },
+        )
+        self.assertEqual(reply.status_code, 200, reply.text)
+        self.assertEqual(reply.json()["delivery"], "waiting_for_admin")
+
+        missing_character = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "partner",
+                "opening_message": "Hello",
+            },
+        )
+        self.assertEqual(missing_character.status_code, 422, missing_character.text)
+
+        audit_rows = self.client.get("/admin/audit", headers=self.admin_headers).json()
+        created_rows = [
+            row for row in audit_rows if row["action"] == "create_admin_session"
+        ]
+        self.assertEqual(len(created_rows), 2)
+
+    def test_admin_can_send_text_text_with_audio_or_audio_only(self) -> None:
+        account = self.client.get("/auth/me", headers=self.user_headers).json()
+        listener = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "listener",
+                "opening_message": "What would you like to talk about?",
+            },
+        )
+        self.assertEqual(listener.status_code, 201, listener.text)
+        session_id = listener.json()["session_id"]
+        generated_wav = wav_recording(seconds=0.75)
+
+        text_only = self.client.post(
+            f"/admin/sessions/{session_id}/messages",
+            headers=self.admin_headers,
+            json={"content": "This remains a fast text-only message."},
+        )
+        self.assertEqual(text_only.status_code, 201, text_only.text)
+        self.assertIsNone(text_only.json()["voice_note_id"])
+
+        with patch.object(
+            main,
+            "generate_admin_speech",
+            return_value=(generated_wav, 0.75),
+        ) as speech:
+            text_audio = self.client.post(
+                f"/admin/sessions/{session_id}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": "You can read this and listen to it.",
+                    "delivery_mode": "text_audio",
+                    "voice_style": "conversational",
+                },
+            )
+            self.assertEqual(text_audio.status_code, 201, text_audio.text)
+            self.assertIsInstance(text_audio.json()["voice_note_id"], int)
+            speech.assert_called_once_with(
+                "You can read this and listen to it.", "conversational"
+            )
+
+            audio_only = self.client.post(
+                f"/admin/sessions/{session_id}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": "Only the generated recording should be visible.",
+                    "delivery_mode": "audio",
+                    "voice_style": "conversational",
+                },
+            )
+            self.assertEqual(audio_only.status_code, 201, audio_only.text)
+
+        messages = self.client.get(
+            f"/sessions/{session_id}/messages", headers=self.user_headers
+        )
+        self.assertEqual(messages.status_code, 200, messages.text)
+        text_audio_message = next(
+            item for item in messages.json() if item["id"] == text_audio.json()["id"]
+        )
+        self.assertEqual(
+            text_audio_message["content"], "You can read this and listen to it."
+        )
+        self.assertIsInstance(text_audio_message["voice_note_id"], int)
+        audio_only_message = next(
+            item for item in messages.json() if item["id"] == audio_only.json()["id"]
+        )
+        self.assertEqual(audio_only_message["content"], "Voice note")
+        self.assertIsInstance(audio_only_message["voice_note_id"], int)
+
+        audio_download = self.client.get(
+            f"/messages/{audio_only.json()['id']}/voice-note",
+            headers=self.user_headers,
+        )
+        self.assertEqual(audio_download.status_code, 200, audio_download.text)
+        self.assertEqual(audio_download.content, generated_wav)
+
+        with patch.object(
+            main,
+            "generate_admin_speech",
+            return_value=(generated_wav, 0.75),
+        ) as seductive_listener_speech:
+            seductive_listener = self.client.post(
+                f"/admin/sessions/{session_id}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": "I am listening. Tell me what happened.",
+                    "delivery_mode": "audio",
+                    "voice_style": "seductive",
+                },
+            )
+        self.assertEqual(seductive_listener.status_code, 201, seductive_listener.text)
+        seductive_listener_speech.assert_called_once_with(
+            "I am listening. Tell me what happened.", "seductive"
+        )
+
+        partner = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "partner",
+                "opening_message": "I was hoping you would message.",
+                "persona": "crush",
+                "scenario": "practice_opening_up",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(partner.status_code, 201, partner.text)
+        with patch.object(
+            main,
+            "generate_admin_speech",
+            return_value=(generated_wav, 0.75),
+        ) as seductive_speech:
+            seductive = self.client.post(
+                f"/admin/sessions/{partner.json()['session_id']}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": "Come a little closer and tell me what you were thinking.",
+                    "delivery_mode": "audio",
+                    "voice_style": "seductive",
+                },
+            )
+        self.assertEqual(seductive.status_code, 201, seductive.text)
+        seductive_speech.assert_called_once_with(
+            "Come a little closer and tell me what you were thinking.", "seductive"
+        )
+
+    def test_admin_speech_uses_expressive_direction_and_combines_wav_chunks(self) -> None:
+        generated_chunk = wav_recording(seconds=0.4)
+        response = SimpleNamespace(status_code=200, content=generated_chunk)
+        long_draft = "A gentle sentence for this voice message. " * 8
+        with patch("main.requests.post", return_value=response) as speech_request:
+            content, duration = main.generate_admin_speech(long_draft, "seductive")
+
+        self.assertGreater(speech_request.call_count, 1)
+        for call in speech_request.call_args_list:
+            self.assertEqual(
+                call.kwargs["json"]["model"],
+                "canopylabs/orpheus-v1-english",
+            )
+            self.assertEqual(call.kwargs["json"]["voice"], "troy")
+            self.assertTrue(call.kwargs["json"]["input"].startswith("[breathy] "))
+            self.assertEqual(call.kwargs["json"]["response_format"], "wav")
+        self.assertTrue(content.startswith(b"RIFF"))
+        self.assertAlmostEqual(
+            duration,
+            0.4 * speech_request.call_count,
+            places=2,
+        )
+
+    def test_admin_speech_reports_when_provider_terms_are_not_accepted(self) -> None:
+        response = SimpleNamespace(
+            status_code=400,
+            content=b"",
+            json=lambda: {"error": {"code": "model_terms_required"}},
+        )
+        with patch("main.requests.post", return_value=response):
+            with self.assertRaises(main.HTTPException) as raised:
+                main.generate_admin_speech("A short voice message.", "conversational")
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertIn("accept the Orpheus speech model terms", raised.exception.detail)
+
+    def test_admin_voice_configuration_is_restricted_to_male_voices(self) -> None:
+        self.assertIn(main.GROQ_TTS_NATURAL_VOICE, main.GROQ_TTS_MALE_VOICES)
+        self.assertIn(main.GROQ_TTS_SEDUCTIVE_VOICE, main.GROQ_TTS_MALE_VOICES)
+        self.assertEqual(main.GROQ_TTS_NATURAL_VOICE, "troy")
+        self.assertEqual(main.GROQ_TTS_SEDUCTIVE_VOICE, "troy")
+
+    def test_admin_recording_is_transcribed_then_replaced_with_ai_audio(self) -> None:
+        account = self.client.get("/auth/me", headers=self.user_headers).json()
+        session = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "partner",
+                "opening_message": "Tell me what is on your mind.",
+                "persona": "crush",
+                "scenario": "practice_opening_up",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(session.status_code, 201, session.text)
+        session_id = session.json()["session_id"]
+        original_recording = wav_recording(seconds=0.75)
+        generated_recording = wav_recording(seconds=0.4, frame_rate=16_000)
+        encoded = base64.b64encode(original_recording).decode("ascii")
+
+        with patch.object(
+            main,
+            "transcribe_admin_recording",
+            return_value="Tumhari awaaz sun kar acha laga.",
+        ) as transcription, patch.object(
+            main,
+            "generate_admin_speech",
+            return_value=(generated_recording, 0.4),
+        ) as speech:
+            sent = self.client.post(
+                f"/admin/sessions/{session_id}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": "",
+                    "delivery_mode": "audio",
+                    "voice_style": "seductive",
+                    "draft_source": "recording",
+                    "recording_base64": encoded,
+                    "recording_mime_type": "audio/wav",
+                    "recording_filename": "real-admin-voice.wav",
+                },
+            )
+
+        self.assertEqual(sent.status_code, 201, sent.text)
+        transcription.assert_called_once_with(
+            original_recording,
+            "real-admin-voice.wav",
+        )
+        speech.assert_called_once_with(
+            "Tumhari awaaz sun kar acha laga.",
+            "seductive",
+        )
+        downloaded = self.client.get(
+            f"/messages/{sent.json()['id']}/voice-note",
+            headers=self.user_headers,
+        )
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, generated_recording)
+        self.assertNotEqual(downloaded.content, original_recording)
+        with main.closing(main.get_connection()) as connection:
+            revision = connection.execute(
+                "SELECT original_content, sent_content FROM admin_message_revisions "
+                "WHERE message_id = ?",
+                (sent.json()["id"],),
+            ).fetchone()
+        self.assertEqual(revision["original_content"], "Tumhari awaaz sun kar acha laga.")
+        self.assertEqual(revision["sent_content"], "Tumhari awaaz sun kar acha laga.")
+
+    def test_admin_can_preview_recording_transcript_before_sending(self) -> None:
+        account = self.client.get("/auth/me", headers=self.user_headers).json()
+        session = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "listener",
+                "opening_message": "I am listening.",
+            },
+        )
+        session_id = session.json()["session_id"]
+        original_recording = wav_recording(seconds=1.25)
+        with patch.object(
+            main,
+            "transcribe_admin_recording",
+            return_value="Aap araam se batayein.",
+        ) as transcription:
+            preview = self.client.post(
+                f"/admin/sessions/{session_id}/voice-transcription",
+                headers=self.admin_headers,
+                json={
+                    "audio_base64": base64.b64encode(original_recording).decode("ascii"),
+                    "audio_mime_type": "audio/wav",
+                    "audio_filename": "preview.wav",
+                },
+            )
+
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["transcript"], "Aap araam se batayein.")
+        self.assertAlmostEqual(preview.json()["duration_seconds"], 1.25, places=2)
+        transcription.assert_called_once_with(original_recording, "preview.wav")
+
+    def test_admin_voice_preview_is_the_exact_audio_sent_to_the_user(self) -> None:
+        account = self.client.get("/auth/me", headers=self.user_headers).json()
+        session = self.client.post(
+            "/admin/sessions",
+            headers=self.admin_headers,
+            json={
+                "user_id": account["id"],
+                "mode": "partner",
+                "opening_message": "I am here.",
+                "persona": "crush",
+                "scenario": "practice_opening_up",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        session_id = session.json()["session_id"]
+        approved_audio = wav_recording(seconds=0.65, frame_rate=16_000)
+
+        with patch.object(
+            main,
+            "generate_admin_speech",
+            return_value=(approved_audio, 0.65),
+        ) as speech:
+            preview = self.client.post(
+                f"/admin/sessions/{session_id}/voice-preview",
+                headers=self.admin_headers,
+                json={
+                    "content": "Tumhari awaaz sun kar acha laga.",
+                    "voice_style": "seductive",
+                    "draft_source": "text",
+                },
+            )
+
+        self.assertEqual(preview.status_code, 200, preview.text)
+        speech.assert_called_once_with(
+            "Tumhari awaaz sun kar acha laga.",
+            "seductive",
+        )
+        preview_data = preview.json()
+        self.assertEqual(
+            base64.b64decode(preview_data["audio_base64"]),
+            approved_audio,
+        )
+
+        with patch.object(main, "generate_admin_speech") as regenerated:
+            sent = self.client.post(
+                f"/admin/sessions/{session_id}/messages",
+                headers=self.admin_headers,
+                json={
+                    "content": preview_data["transcript"],
+                    "delivery_mode": "audio",
+                    "voice_style": "seductive",
+                    "draft_source": "text",
+                    "voice_preview_base64": preview_data["audio_base64"],
+                    "voice_preview_mime_type": preview_data["audio_mime_type"],
+                    "voice_preview_filename": preview_data["audio_filename"],
+                },
+            )
+
+        self.assertEqual(sent.status_code, 201, sent.text)
+        regenerated.assert_not_called()
+        downloaded = self.client.get(
+            f"/messages/{sent.json()['id']}/voice-note",
+            headers=self.user_headers,
+        )
+        self.assertEqual(downloaded.status_code, 200, downloaded.text)
+        self.assertEqual(downloaded.content, approved_audio)
+
+    def test_admin_transcription_uses_groq_whisper_multipart_request(self) -> None:
+        recording = wav_recording(seconds=0.5)
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"text": "  Main bilkul theek hoon.  "},
+        )
+        with patch("main.requests.post", return_value=response) as request:
+            transcript = main.transcribe_admin_recording(recording, "draft.wav")
+
+        self.assertEqual(transcript, "Main bilkul theek hoon.")
+        call = request.call_args
+        self.assertEqual(call.args[0], main.GROQ_STT_API_URL)
+        self.assertEqual(call.kwargs["data"]["model"], "whisper-large-v3-turbo")
+        self.assertEqual(call.kwargs["data"]["response_format"], "json")
+        self.assertEqual(call.kwargs["files"]["file"], ("draft.wav", recording, "audio/wav"))
+        self.assertNotIn("Content-Type", call.kwargs["headers"])
+
     def test_live_admin_handoff_and_session_prompt(self) -> None:
         privacy = self.client.put(
             "/account/privacy",
@@ -1244,6 +2429,15 @@ class DilSeApiTests(unittest.TestCase):
             headers=self.admin_headers,
         )
         self.assertTrue(typing_detail.json()["user_typing"])
+        typing_status = self.client.get(
+            "/admin/sessions/live_session_123/typing",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(typing_status.status_code, 200, typing_status.text)
+        self.assertEqual(
+            typing_status.json(),
+            {"session_id": "live_session_123", "user_typing": True},
+        )
         stopped_typing = self.client.post(
             "/sessions/live_session_123/typing",
             headers=self.user_headers,
@@ -1255,6 +2449,11 @@ class DilSeApiTests(unittest.TestCase):
             headers=self.admin_headers,
         )
         self.assertFalse(stopped_detail.json()["user_typing"])
+        stopped_status = self.client.get(
+            "/admin/sessions/live_session_123/typing",
+            headers=self.admin_headers,
+        )
+        self.assertFalse(stopped_status.json()["user_typing"])
 
     def test_user_and_admin_messages_can_reply_to_a_specific_message(self) -> None:
         session_id = "threaded_reply_session_123"
@@ -1361,7 +2560,10 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(takeover.status_code, 200, takeover.text)
 
-        image_bytes = b"\x89PNG\r\n\x1a\n" + b"dilse-test-image"
+        from PIL import Image
+        image_buffer = BytesIO()
+        Image.new("RGB", (2, 2), "white").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
         sent = self.client.post(
             f"/admin/sessions/{session_id}/messages",
             headers=self.admin_headers,
@@ -1591,6 +2793,156 @@ class DilSeApiTests(unittest.TestCase):
             f"/messages/{message_id}/voice-note", headers=self.user_headers
         )
         self.assertEqual(missing.status_code, 404, missing.text)
+
+    def test_telegram_relay_uploads_user_voice_note_to_conversation_topic(self) -> None:
+        session_id = "telegram_voice_note_session_123"
+        audio_bytes = wav_recording(seconds=2.4)
+        telegram_calls: list[tuple[str, dict[str, object]]] = []
+        upload_calls: list[dict[str, object]] = []
+        next_message_id = 1300
+
+        def fake_telegram_api(
+            method: str,
+            payload: dict[str, object] | None = None,
+            request_timeout: int = 30,
+        ) -> object:
+            del request_timeout
+            nonlocal next_message_id
+            data = payload or {}
+            telegram_calls.append((method, data))
+            if method == "createForumTopic":
+                return {"message_thread_id": 778, "name": data["name"]}
+            if method == "sendMessage":
+                next_message_id += 1
+                return {"message_id": next_message_id}
+            return True
+
+        def fake_telegram_upload(
+            method: str,
+            payload: dict[str, object],
+            *,
+            file_field: str,
+            filename: str,
+            content: bytes,
+            mime_type: str,
+            request_timeout: int = 60,
+        ) -> object:
+            upload_calls.append(
+                {
+                    "method": method,
+                    "payload": payload,
+                    "file_field": file_field,
+                    "filename": filename,
+                    "content": content,
+                    "mime_type": mime_type,
+                    "request_timeout": request_timeout,
+                }
+            )
+            return {"message_id": 1399}
+
+        telegram_environment = {
+            "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+            "TELEGRAM_ADMIN_USER_IDS": "42",
+            "TELEGRAM_ADMIN_CHAT_ID": "-100123456",
+        }
+        with patch.dict(os.environ, telegram_environment, clear=False), patch.object(
+            main, "telegram_api", side_effect=fake_telegram_api
+        ), patch.object(
+            main, "telegram_api_upload", side_effect=fake_telegram_upload
+        ):
+            sent = self.client.post(
+                f"/sessions/{session_id}/voice-notes",
+                headers=self.user_headers,
+                json={
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "audio_mime_type": "audio/wav",
+                    "audio_filename": "telegram-private-note.wav",
+                    "upload_id": "telegram_voice_note_upload_12345",
+                    "mode": "listener",
+                },
+            )
+            self.assertEqual(sent.status_code, 201, sent.text)
+            self.assertEqual(main.process_telegram_outbox(), 1)
+
+        self.assertEqual(len(upload_calls), 1)
+        upload = upload_calls[0]
+        self.assertEqual(upload["method"], "sendDocument")
+        self.assertEqual(upload["file_field"], "document")
+        self.assertEqual(upload["filename"], "telegram-private-note.wav")
+        self.assertEqual(upload["mime_type"], "audio/wav")
+        self.assertEqual(upload["content"], audio_bytes)
+        self.assertEqual(upload["payload"]["message_thread_id"], 778)
+        self.assertIn("User voice note", str(upload["payload"]["caption"]))
+        self.assertIn("0:02", str(upload["payload"]["caption"]))
+        relayed_text = "\n".join(
+            str(payload.get("text") or "")
+            for method, payload in telegram_calls
+            if method == "sendMessage"
+        )
+        self.assertNotIn("<b>User</b>\nVoice note", relayed_text)
+        with main.get_connection() as connection:
+            link = connection.execute(
+                """SELECT dilse_message_id FROM telegram_message_links
+                   WHERE telegram_message_id = 1399"""
+            ).fetchone()
+        self.assertIsNotNone(link)
+        self.assertEqual(link["dilse_message_id"], sent.json()["user_message_id"])
+
+    def test_telegram_voice_note_relay_falls_back_to_dashboard_notice(self) -> None:
+        session_id = "telegram_voice_fallback_session_123"
+        audio_bytes = wav_recording(seconds=1)
+        sent_text: list[str] = []
+
+        def fake_telegram_api(
+            method: str,
+            payload: dict[str, object] | None = None,
+            request_timeout: int = 30,
+        ) -> object:
+            del request_timeout
+            data = payload or {}
+            if method == "createForumTopic":
+                return {"message_thread_id": 779, "name": data["name"]}
+            if method == "sendMessage":
+                sent_text.append(str(data.get("text") or ""))
+                return {"message_id": 1400 + len(sent_text)}
+            return True
+
+        telegram_environment = {
+            "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+            "TELEGRAM_ADMIN_USER_IDS": "42",
+            "TELEGRAM_ADMIN_CHAT_ID": "-100123456",
+        }
+        with patch.dict(os.environ, telegram_environment, clear=False), patch.object(
+            main, "telegram_api", side_effect=fake_telegram_api
+        ), patch.object(
+            main,
+            "telegram_api_upload",
+            side_effect=RuntimeError("Telegram sendDocument failed: rejected"),
+        ):
+            sent = self.client.post(
+                f"/sessions/{session_id}/voice-notes",
+                headers=self.user_headers,
+                json={
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "audio_mime_type": "audio/wav",
+                    "audio_filename": "fallback-note.wav",
+                    "upload_id": "telegram_voice_fallback_upload_12345",
+                    "mode": "listener",
+                },
+            )
+            self.assertEqual(sent.status_code, 201, sent.text)
+            self.assertEqual(main.process_telegram_outbox(), 1)
+
+        self.assertTrue(
+            any("administrator dashboard" in message for message in sent_text)
+        )
+        with main.get_connection() as connection:
+            outbox = connection.execute(
+                "SELECT status, attempts FROM telegram_outbox WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        self.assertEqual(outbox["status"], "sent")
+        self.assertEqual(outbox["attempts"], 1)
 
     def test_live_admin_handoff_supports_partner_mode(self) -> None:
         privacy = self.client.put(
@@ -2276,6 +3628,63 @@ class DilSeApiTests(unittest.TestCase):
             row for row in audit_rows if row["action"] == "delete_session_message"
         ]
         self.assertEqual(len(deletion_rows), 2)
+
+    def test_predefined_partner_characters_use_and_remember_opening_details(self) -> None:
+        opening = (
+            "Your name is Ayaan, you are shy in person, and you use dry humour. "
+            "I have wanted to tell you something."
+        )
+        crush = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "crush_character_123",
+                "message": opening,
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "crush",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(crush.status_code, 200, crush.text)
+        crush_prompt = FakeCompletions.calls[-1]["messages"][1]["content"]
+        self.assertIn("warm, curious, lightly flirtatious", crush_prompt)
+        self.assertIn("Supplemental character context", crush_prompt)
+        self.assertIn("additions to the built-in character profile", crush_prompt)
+        self.assertIn(opening, crush_prompt)
+
+        follow_up = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "crush_character_123",
+                "message": "What did you think I was going to say?",
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "crush",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(follow_up.status_code, 200, follow_up.text)
+        self.assertIn(opening, FakeCompletions.calls[-1]["messages"][1]["content"])
+
+        fantasy = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "fantasy_character_123",
+                "message": "Your name is Zain and this scene takes place in a rooftop garden.",
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "fantasy_partner",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(fantasy.status_code, 200, fantasy.text)
+        fantasy_prompt = FakeCompletions.calls[-1]["messages"][1]["content"]
+        self.assertIn("confident, attentive, affectionate", fantasy_prompt)
+        self.assertIn("fictional adult romantic partner", fantasy_prompt)
+        self.assertIn("rooftop garden", fantasy_prompt)
 
     def test_partner_character_profile_is_prompted_stored_and_reused(self) -> None:
         privacy = self.client.put(
@@ -3091,13 +4500,90 @@ class DilSeApiTests(unittest.TestCase):
             "DELETE", "/account", headers=self.user_headers, json={"password": "wrong-password"}
         )
         self.assertEqual(wrong.status_code, 401)
-        deleted = self.client.request(
-            "DELETE",
-            "/account",
-            headers=self.user_headers,
-            json={"password": "long-test-password"},
+        delivery: dict[str, object] = {}
+
+        def capture_confirmation(
+            recipient: str,
+            display_name: str,
+            departure_reason: str,
+            deleted_at: str,
+            confirmation_reference: str,
+        ) -> str:
+            with main.get_connection() as connection:
+                delivery["remaining_users"] = connection.execute(
+                    "SELECT COUNT(*) FROM users WHERE email = ?", (recipient,)
+                ).fetchone()[0]
+            delivery.update(
+                recipient=recipient,
+                display_name=display_name,
+                departure_reason=departure_reason,
+                deleted_at=deleted_at,
+                confirmation_reference=confirmation_reference,
+            )
+            return "resend-deletion-test-id"
+
+        with patch.object(
+            main,
+            "send_account_deletion_confirmation_email",
+            side_effect=capture_confirmation,
+        ):
+            deleted = self.client.request(
+                "DELETE",
+                "/account",
+                headers=self.user_headers,
+                json={
+                    "password": "long-test-password",
+                    "departure_reason": "privacy_or_trust",
+                },
+            )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        payload = deleted.json()
+        self.assertTrue(payload["email_sent"])
+        self.assertEqual(payload["departure_reason"], "Privacy or trust concerns")
+        self.assertRegex(payload["confirmation_reference"], r"^DIL-\d{8}-[A-F0-9]{6}$")
+        self.assertEqual(delivery["recipient"], "tester@example.com")
+        self.assertEqual(delivery["remaining_users"], 0)
+
+    def test_account_deletion_still_completes_if_confirmation_email_fails(self) -> None:
+        with patch.object(
+            main,
+            "send_account_deletion_confirmation_email",
+            side_effect=RuntimeError("email unavailable"),
+        ):
+            deleted = self.client.request(
+                "DELETE",
+                "/account",
+                headers=self.user_headers,
+                json={
+                    "password": "long-test-password",
+                    "departure_reason": "prefer_not_to_say",
+                },
+            )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertFalse(deleted.json()["email_sent"])
+        self.assertEqual(deleted.json()["departure_reason"], "Prefer not to say")
+        self.assertEqual(
+            self.client.get("/auth/me", headers=self.user_headers).status_code,
+            401,
         )
+
+    def test_legacy_account_deletion_request_keeps_the_previous_status_code(self) -> None:
+        with patch.object(
+            main,
+            "send_account_deletion_confirmation_email",
+            return_value="legacy-deletion-email-id",
+        ):
+            deleted = self.client.request(
+                "DELETE",
+                "/account",
+                headers=self.user_headers,
+                json={"password": "long-test-password"},
+            )
         self.assertEqual(deleted.status_code, 204, deleted.text)
+        self.assertEqual(
+            self.client.get("/auth/me", headers=self.user_headers).status_code,
+            401,
+        )
 
 
 if __name__ == "__main__":

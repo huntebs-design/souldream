@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import ipaddress
+import time
+from collections.abc import Mapping
 import json
 import mimetypes
 import os
@@ -14,11 +18,36 @@ from pathlib import Path
 
 import httpx
 import websockets
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from seo_content import TOPICS as SEO_TOPICS, URDU_TOPICS
+
+VISITOR_TRACKING_SECRET = os.getenv("VISITOR_TRACKING_SECRET", "").strip()
+STREAMLIT_SUPERVISOR_CHECK_SECONDS = max(
+    0.25,
+    float(os.getenv("DILSE_STREAMLIT_SUPERVISOR_CHECK_SECONDS", "1")),
+)
+STREAMLIT_RESTART_DELAY_SECONDS = max(
+    0.25,
+    float(os.getenv("DILSE_STREAMLIT_RESTART_DELAY_SECONDS", "1")),
+)
+STREAMLIT_RESTART_MAX_DELAY_SECONDS = max(
+    STREAMLIT_RESTART_DELAY_SECONDS,
+    float(os.getenv("DILSE_STREAMLIT_RESTART_MAX_DELAY_SECONDS", "30")),
+)
+
+IP_ACCESS_CACHE_SECONDS = 2.0
+WEBSOCKET_BLOCK_CHECK_SECONDS = 5.0
+MAX_PROXY_BODY_BYTES = 24 * 1024 * 1024
+MAX_WEBSOCKET_MESSAGE_BYTES = 24 * 1024 * 1024
+FORWARDED_IP_HEADERS = {"forwarded", "x-forwarded-for", "x-real-ip", "x-dilse-internal-key", "x-dilse-client-fingerprint"}
+_ip_access_cache: dict[str, tuple[bool, float]] = {}
 
 ROOT = Path(__file__).parent
 SITE_URL = os.getenv("SITE_URL", "https://www.baatdilse.com").rstrip("/")
@@ -99,6 +128,226 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "content-encoding",
     "date", "server",
 }
+
+
+def canonical_ip_address(raw_address: str | None) -> str | None:
+    if not raw_address:
+        return None
+    try:
+        address = ipaddress.ip_address(raw_address.strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped.compressed
+    return address.compressed
+
+
+def trusted_client_ip(
+    request_headers: Mapping[str, str],
+    direct_client_host: str | None = None,
+) -> str | None:
+    """Use Railway's edge address in production and the socket peer locally."""
+    if os.getenv("RAILWAY_ENVIRONMENT_ID"):
+        if not request_headers.get("x-railway-edge"):
+            return None
+        return canonical_ip_address(request_headers.get("x-real-ip"))
+    return canonical_ip_address(direct_client_host)
+
+
+async def backend_ip_is_blocked(raw_address: str | None) -> bool:
+    """Check the persistent API block list, with a short per-process cache."""
+    ip_address = canonical_ip_address(raw_address)
+    if not ip_address or not VISITOR_TRACKING_SECRET:
+        return False
+    now = time.monotonic()
+    cached = _ip_access_cache.get(ip_address)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"{BACKEND_ORIGIN}/visitor/access-check",
+                json={"ip_address": ip_address},
+                headers={"X-Visitor-Tracking-Key": VISITOR_TRACKING_SECRET},
+            )
+        response.raise_for_status()
+        blocked = bool(response.json().get("blocked"))
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return cached[0] if cached else False
+    _ip_access_cache[ip_address] = (blocked, now + IP_ACCESS_CACHE_SECONDS)
+    return blocked
+
+
+def forwarded_request_headers(
+    request: Request,
+    *,
+    include_internal_identity: bool = False,
+) -> dict[str, str]:
+    """Forward browser headers after replacing client-controlled IP headers."""
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in HOP_BY_HOP
+        and key.lower() != "host"
+        and key.lower() not in FORWARDED_IP_HEADERS
+    }
+    direct_host = request.client.host if request.client else None
+    ip_address = trusted_client_ip(request.headers, direct_host)
+    if ip_address:
+        headers["X-Real-IP"] = ip_address
+    if include_internal_identity and VISITOR_TRACKING_SECRET:
+        headers["X-DilSe-Internal-Key"] = VISITOR_TRACKING_SECRET
+        fingerprint_source = ip_address or direct_host or "unknown"
+        headers["X-DilSe-Client-Fingerprint"] = hashlib.sha256(
+            f"dilse-edge:{fingerprint_source}".encode("utf-8")
+        ).hexdigest()
+    return headers
+
+
+async def limited_request_body(request: Request) -> bytes:
+    """Read a proxied request without allowing an unbounded in-memory body."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            parsed_length = int(content_length)
+            if parsed_length < 0 or parsed_length > MAX_PROXY_BODY_BYTES:
+                raise ValueError("request body is too large")
+        except ValueError as exc:
+            raise ValueError("invalid or oversized request body") from exc
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > MAX_PROXY_BODY_BYTES:
+            raise ValueError("request body is too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def streamlit_websocket_headers(
+    request_headers: Mapping[str, str],
+) -> dict[str, str]:
+    """Forward browser context and a validated Railway edge address."""
+    headers: dict[str, str] = {}
+    cookie = request_headers.get("cookie")
+    if cookie:
+        headers["Cookie"] = cookie
+
+    ip_address = trusted_client_ip(request_headers)
+    if ip_address:
+        headers["X-Real-IP"] = ip_address
+    return headers
+
+
+
+def add_security_headers(response: Response) -> Response:
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), geolocation=(), microphone=(self), payment=(), usb=()",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+    )
+    return response
+
+
+
+def streamlit_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(ROOT / "app.py"),
+        "--server.address=127.0.0.1",
+        f"--server.port={STREAMLIT_PORT}",
+        "--server.headless=true",
+        "--server.baseUrlPath=app",
+    ]
+
+
+
+class StreamlitProcessSupervisor:
+    """Keep the private Streamlit child alive behind the public proxy."""
+
+    def __init__(
+        self,
+        *,
+        restart_delay_seconds: float = STREAMLIT_RESTART_DELAY_SECONDS,
+        max_restart_delay_seconds: float = STREAMLIT_RESTART_MAX_DELAY_SECONDS,
+    ) -> None:
+        self.restart_delay_seconds = restart_delay_seconds
+        self.max_restart_delay_seconds = max_restart_delay_seconds
+        self.current_restart_delay = restart_delay_seconds
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started_at = 0.0
+        self.restart_after = 0.0
+        self.stopping = False
+
+    def ensure_running(self, *, now: float | None = None) -> bool:
+        """Start or restart Streamlit when its previous process has exited."""
+        current_time = time.monotonic() if now is None else now
+        if self.stopping:
+            return False
+
+        if self.process is not None:
+            exit_code = self.process.poll()
+            if exit_code is None:
+                return True
+            runtime = max(0.0, current_time - self.started_at)
+            print(
+                f"Streamlit exited with status {exit_code} after {runtime:.1f}s; restarting.",
+                flush=True,
+            )
+            self.process = None
+            if runtime >= 60:
+                restart_delay = self.restart_delay_seconds
+                self.current_restart_delay = self.restart_delay_seconds
+            else:
+                restart_delay = self.current_restart_delay
+                self.current_restart_delay = min(
+                    self.current_restart_delay * 2,
+                    self.max_restart_delay_seconds,
+                )
+            self.restart_after = current_time + restart_delay
+            return False
+
+        if current_time < self.restart_after:
+            return False
+        try:
+            self.process = subprocess.Popen(streamlit_command(), cwd=ROOT)
+        except OSError as exc:
+            print(f"Streamlit could not start: {exc}; retrying.", flush=True)
+            self.restart_after = current_time + self.current_restart_delay
+            self.current_restart_delay = min(
+                self.current_restart_delay * 2,
+                self.max_restart_delay_seconds,
+            )
+            return False
+        self.started_at = current_time
+        return True
+
+    async def run(self) -> None:
+        while not self.stopping:
+            self.ensure_running()
+            await asyncio.sleep(STREAMLIT_SUPERVISOR_CHECK_SECONDS)
+
+    def stop(self) -> None:
+        self.stopping = True
+        process = self.process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=8)
+        if process.poll() is None:
+            process.kill()
+
 
 
 def _structured_data(
@@ -208,37 +457,15 @@ def page_shell(
       <a href="/how-it-works/">How it works</a>
       <a href="/conversation-topics/">Conversation topics</a>
       <a href="/ur/" lang="ur">اردو</a>
-      <a class="nav-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Android app</a>
       <a class="nav-cta" href="/app/?auth=signin">Sign in</a>
     </nav>
   </header>
   <main id="main">{body}</main>
-  <aside class="android-install-prompt" id="android-install-prompt" aria-label="Download DilSe for Android" hidden>
-    <div class="install-prompt-brand">
-      <img src="/assets/dilse-mark.svg" alt="">
-      <div><strong>Take DilSe with you</strong><span>Android 8+ · 58 MB</span></div>
-    </div>
-    <a class="install-prompt-download" href="/downloads/DilSe-latest.apk" download>Download app</a>
-    <button class="install-prompt-dismiss" type="button" aria-label="Dismiss Android app download">Not now</button>
-  </aside>
   <footer>
     <img src="/assets/dilse-logo.svg" alt="DilSe">
     <p>Relationship guidance and conversation practice for adults 18+ in Pakistan.</p>
     <div><a href="/about/">About</a><a href="/editorial-policy/">Editorial policy</a><a href="/contact/">Contact</a><a href="/privacy/">Privacy</a><a href="/safety/">Safety</a><a href="/app/?page=terms">Terms</a></div>
   </footer>
-  <script>
-    (() => {{
-      const prompt = document.getElementById('android-install-prompt');
-      const isAndroid = /Android/i.test(navigator.userAgent);
-      const dismissed = sessionStorage.getItem('dilse-android-install-dismissed') === '1';
-      if (!prompt || !isAndroid || dismissed) return;
-      prompt.hidden = false;
-      prompt.querySelector('.install-prompt-dismiss')?.addEventListener('click', () => {{
-        prompt.hidden = true;
-        sessionStorage.setItem('dilse-android-install-dismissed', '1');
-      }});
-    }})();
-  </script>
 </body>
 </html>"""
 
@@ -255,7 +482,7 @@ def home_page() -> str:
     <h1>Relationship conversation practice for Pakistani women</h1>
     <p class="lede">Talk through a relationship concern, find the words you want to use, and practise the conversation before having it at home.</p>
     <p class="roman-urdu" lang="ur-Latn">Jo baat kehna mushkil ho, pehle yahan keh lijiye.</p>
-    <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="button button-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Download Android app</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
+    <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
     <ul class="facts"><li>500,000+ women supported</li><li>Psychologist-trained AI</li><li>100% On-device privacy</li></ul>
   </div>
   <div class="hero-art"><img src="/assets/dilse-woman-letter.webp" width="768" height="1024" alt="Illustration of a Pakistani woman holding a letter beside a window"><p>A place to prepare the words you have been holding back.</p></div>
@@ -337,7 +564,6 @@ def android_page() -> str:
     <p class="eyebrow">DilSe for Android</p>
     <h1>Your conversations, ready when you are</h1>
     <p class="lede">Continue Listener and Partner conversations, record voice notes and receive a private alert when a DilSe response is waiting.</p>
-    <a class="button android-download" href="/downloads/DilSe-latest.apk" download>Download DilSe for Android</a>
     <p class="download-note">Android 8 or newer · Adults 18+ · Version 1.0.0</p>
   </div>
   <div class="android-device" aria-label="Preview of the DilSe Android conversation screen">
@@ -575,26 +801,76 @@ def urdu_topic_page(slug: str) -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    process = subprocess.Popen(
-        [
-            sys.executable, "-m", "streamlit", "run", str(ROOT / "app.py"),
-            "--server.address=127.0.0.1", f"--server.port={STREAMLIT_PORT}",
-            "--server.headless=true", "--server.baseUrlPath=app",
-        ],
-        cwd=ROOT,
-    )
-    yield
-    process.terminate()
-    with suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=8)
-    if process.poll() is None:
-        process.kill()
+    supervisor = StreamlitProcessSupervisor()
+    supervisor.ensure_running()
+    supervisor_task = asyncio.create_task(supervisor.run())
+    try:
+        yield
+    finally:
+        supervisor.stop()
+        supervisor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await supervisor_task
 
 
-app = FastAPI(title="DilSe public site", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="DilSe public site", openapi_url=None, docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 app.mount("/site", StaticFiles(directory=ROOT / "public"), name="site")
 app.mount("/downloads", StaticFiles(directory=ROOT / "downloads"), name="downloads")
+
+
+@app.middleware("http")
+async def enforce_ip_block_list(request: Request, call_next) -> Response:
+    """Reject blocked addresses before any public, app, download, or API route."""
+    raw_path = str(request.scope.get("path") or "")
+    if raw_path != "/health":
+        direct_host = request.client.host if request.client else None
+        ip_address = trusted_client_ip(request.headers, direct_host)
+        if await backend_ip_is_blocked(ip_address):
+            return add_security_headers(
+                PlainTextResponse(
+                    "Access denied.",
+                    status_code=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+            )
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            parsed_length = int(content_length)
+            oversized = parsed_length < 0 or parsed_length > MAX_PROXY_BODY_BYTES
+        except ValueError:
+            oversized = True
+        if oversized:
+            return add_security_headers(
+                PlainTextResponse("Request body is too large.", status_code=413)
+            )
+    return add_security_headers(await call_next(request))
+
+
+@app.get("/health")
+async def web_health() -> Response:
+    """Report unhealthy when the internal Streamlit server is unavailable."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            upstream = await client.get(f"{STREAMLIT_ORIGIN}/app/_stcore/health")
+    except httpx.RequestError:
+        return Response(
+            content='{"status":"unavailable","streamlit":false}',
+            status_code=503,
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+    status_code = 200 if upstream.status_code == 200 else 503
+    return Response(
+        content=json.dumps(
+            {"status": "ok" if status_code == 200 else "unavailable", "streamlit": status_code == 200}
+        ),
+        status_code=status_code,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -619,17 +895,18 @@ async def api_proxy(path: str, request: Request) -> Response:
     """Expose the private Railway API to signed mobile clients on the main domain."""
     query = f"?{request.url.query}" if request.url.query else ""
     target = f"{BACKEND_ORIGIN}/{path}{query}"
-    headers = {
-        key: value for key, value in request.headers.items()
-        if key.lower() not in HOP_BY_HOP and key.lower() != "host"
-    }
+    headers = forwarded_request_headers(request, include_internal_identity=True)
+    try:
+        body = await limited_request_body(request)
+    except ValueError:
+        return PlainTextResponse("Request body is too large.", status_code=413)
     try:
         async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
             upstream = await client.request(
                 request.method,
                 target,
                 headers=headers,
-                content=await request.body(),
+                content=body,
             )
     except httpx.RequestError:
         return PlainTextResponse("DilSe is starting. Try again in a moment.", status_code=503)
@@ -709,9 +986,12 @@ async def app_slash() -> RedirectResponse:
 @app.websocket("/app/_stcore/stream")
 async def streamlit_websocket(client: WebSocket) -> None:
     query = f"?{client.url.query}" if client.url.query else ""
-    headers = {}
-    if client.headers.get("cookie"):
-        headers["Cookie"] = client.headers["cookie"]
+    headers = streamlit_websocket_headers(client.headers)
+    direct_host = client.client.host if client.client else None
+    ip_address = trusted_client_ip(client.headers, direct_host)
+    if await backend_ip_is_blocked(ip_address):
+        await client.close(code=1008, reason="Access denied.")
+        return
     offered_protocols = [
         protocol.strip()
         for protocol in client.headers.get("sec-websocket-protocol", "").split(",")
@@ -722,7 +1002,7 @@ async def streamlit_websocket(client: WebSocket) -> None:
             f"ws://127.0.0.1:{STREAMLIT_PORT}/app/_stcore/stream{query}",
             additional_headers=headers,
             subprotocols=offered_protocols or None,
-            max_size=None,
+            max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
         ) as upstream:
             await client.accept(subprotocol=upstream.subprotocol)
 
@@ -743,7 +1023,34 @@ async def streamlit_websocket(client: WebSocket) -> None:
                     else:
                         await client.send_text(message)
 
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
+            async def block_monitor() -> None:
+                while True:
+                    await asyncio.sleep(WEBSOCKET_BLOCK_CHECK_SECONDS)
+                    if await backend_ip_is_blocked(ip_address):
+                        with suppress(RuntimeError):
+                            await client.close(code=1008, reason="Access denied.")
+                        await upstream.close(code=1008, reason="Access denied.")
+                        return
+
+            forwarders = {
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+                asyncio.create_task(block_monitor()),
+            }
+            done, pending = await asyncio.wait(
+                forwarders,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                with suppress(
+                    WebSocketDisconnect,
+                    websockets.ConnectionClosed,
+                    RuntimeError,
+                ):
+                    task.result()
     except (WebSocketDisconnect, websockets.ConnectionClosed):
         return
 
@@ -752,14 +1059,15 @@ async def streamlit_websocket(client: WebSocket) -> None:
 async def streamlit_proxy(path: str, request: Request) -> Response:
     query = f"?{request.url.query}" if request.url.query else ""
     target = f"{STREAMLIT_ORIGIN}/app/{path}{query}"
-    headers = {
-        key: value for key, value in request.headers.items()
-        if key.lower() not in HOP_BY_HOP and key.lower() != "host"
-    }
+    headers = forwarded_request_headers(request)
+    try:
+        body = await limited_request_body(request)
+    except ValueError:
+        return PlainTextResponse("Request body is too large.", status_code=413)
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
             upstream = await client.request(
-                request.method, target, headers=headers, content=await request.body()
+                request.method, target, headers=headers, content=body
             )
     except httpx.RequestError:
         return PlainTextResponse("DilSe is starting. Please refresh in a moment.", status_code=503)

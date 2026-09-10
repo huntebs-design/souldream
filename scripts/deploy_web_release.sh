@@ -19,6 +19,7 @@ cp \
     web.py \
     app.py \
     main.py \
+    media_cache.py \
     seo_content.py \
     seo_expansion.py \
     "${stage_dir}/"
