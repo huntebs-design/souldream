@@ -29,6 +29,19 @@ from fastapi.staticfiles import StaticFiles
 from seo_content import TOPICS as SEO_TOPICS, URDU_TOPICS
 
 VISITOR_TRACKING_SECRET = os.getenv("VISITOR_TRACKING_SECRET", "").strip()
+STREAMLIT_SUPERVISOR_CHECK_SECONDS = max(
+    0.25,
+    float(os.getenv("DILSE_STREAMLIT_SUPERVISOR_CHECK_SECONDS", "1")),
+)
+STREAMLIT_RESTART_DELAY_SECONDS = max(
+    0.25,
+    float(os.getenv("DILSE_STREAMLIT_RESTART_DELAY_SECONDS", "1")),
+)
+STREAMLIT_RESTART_MAX_DELAY_SECONDS = max(
+    STREAMLIT_RESTART_DELAY_SECONDS,
+    float(os.getenv("DILSE_STREAMLIT_RESTART_MAX_DELAY_SECONDS", "30")),
+)
+
 IP_ACCESS_CACHE_SECONDS = 2.0
 WEBSOCKET_BLOCK_CHECK_SECONDS = 5.0
 MAX_PROXY_BODY_BYTES = 24 * 1024 * 1024
@@ -224,6 +237,116 @@ def streamlit_websocket_headers(
     if ip_address:
         headers["X-Real-IP"] = ip_address
     return headers
+
+
+
+def add_security_headers(response: Response) -> Response:
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), geolocation=(), microphone=(self), payment=(), usb=()",
+    )
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+    )
+    return response
+
+
+
+def streamlit_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(ROOT / "app.py"),
+        "--server.address=127.0.0.1",
+        f"--server.port={STREAMLIT_PORT}",
+        "--server.headless=true",
+        "--server.baseUrlPath=app",
+    ]
+
+
+
+class StreamlitProcessSupervisor:
+    """Keep the private Streamlit child alive behind the public proxy."""
+
+    def __init__(
+        self,
+        *,
+        restart_delay_seconds: float = STREAMLIT_RESTART_DELAY_SECONDS,
+        max_restart_delay_seconds: float = STREAMLIT_RESTART_MAX_DELAY_SECONDS,
+    ) -> None:
+        self.restart_delay_seconds = restart_delay_seconds
+        self.max_restart_delay_seconds = max_restart_delay_seconds
+        self.current_restart_delay = restart_delay_seconds
+        self.process: subprocess.Popen[bytes] | None = None
+        self.started_at = 0.0
+        self.restart_after = 0.0
+        self.stopping = False
+
+    def ensure_running(self, *, now: float | None = None) -> bool:
+        """Start or restart Streamlit when its previous process has exited."""
+        current_time = time.monotonic() if now is None else now
+        if self.stopping:
+            return False
+
+        if self.process is not None:
+            exit_code = self.process.poll()
+            if exit_code is None:
+                return True
+            runtime = max(0.0, current_time - self.started_at)
+            print(
+                f"Streamlit exited with status {exit_code} after {runtime:.1f}s; restarting.",
+                flush=True,
+            )
+            self.process = None
+            if runtime >= 60:
+                restart_delay = self.restart_delay_seconds
+                self.current_restart_delay = self.restart_delay_seconds
+            else:
+                restart_delay = self.current_restart_delay
+                self.current_restart_delay = min(
+                    self.current_restart_delay * 2,
+                    self.max_restart_delay_seconds,
+                )
+            self.restart_after = current_time + restart_delay
+            return False
+
+        if current_time < self.restart_after:
+            return False
+        try:
+            self.process = subprocess.Popen(streamlit_command(), cwd=ROOT)
+        except OSError as exc:
+            print(f"Streamlit could not start: {exc}; retrying.", flush=True)
+            self.restart_after = current_time + self.current_restart_delay
+            self.current_restart_delay = min(
+                self.current_restart_delay * 2,
+                self.max_restart_delay_seconds,
+            )
+            return False
+        self.started_at = current_time
+        return True
+
+    async def run(self) -> None:
+        while not self.stopping:
+            self.ensure_running()
+            await asyncio.sleep(STREAMLIT_SUPERVISOR_CHECK_SECONDS)
+
+    def stop(self) -> None:
+        self.stopping = True
+        process = self.process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=8)
+        if process.poll() is None:
+            process.kill()
 
 
 
@@ -678,23 +801,19 @@ def urdu_topic_page(slug: str) -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    process = subprocess.Popen(
-        [
-            sys.executable, "-m", "streamlit", "run", str(ROOT / "app.py"),
-            "--server.address=127.0.0.1", f"--server.port={STREAMLIT_PORT}",
-            "--server.headless=true", "--server.baseUrlPath=app",
-        ],
-        cwd=ROOT,
-    )
-    yield
-    process.terminate()
-    with suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=8)
-    if process.poll() is None:
-        process.kill()
+    supervisor = StreamlitProcessSupervisor()
+    supervisor.ensure_running()
+    supervisor_task = asyncio.create_task(supervisor.run())
+    try:
+        yield
+    finally:
+        supervisor.stop()
+        supervisor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await supervisor_task
 
 
-app = FastAPI(title="DilSe public site", docs_url=None, redoc_url=None, lifespan=lifespan)
+app = FastAPI(title="DilSe public site", openapi_url=None, docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/assets", StaticFiles(directory=ROOT / "assets"), name="assets")
 app.mount("/site", StaticFiles(directory=ROOT / "public"), name="site")
 app.mount("/downloads", StaticFiles(directory=ROOT / "downloads"), name="downloads")
@@ -702,12 +821,56 @@ app.mount("/downloads", StaticFiles(directory=ROOT / "downloads"), name="downloa
 
 @app.middleware("http")
 async def enforce_ip_block_list(request: Request, call_next) -> Response:
-    """Enforce the administrator's exact-IP block list before serving a route."""
-    direct_host = request.client.host if request.client else None
-    ip_address = trusted_client_ip(request.headers, direct_host)
-    if await backend_ip_is_blocked(ip_address):
-        return PlainTextResponse("Access denied.", status_code=403, headers={"Cache-Control": "no-store"})
-    return await call_next(request)
+    """Reject blocked addresses before any public, app, download, or API route."""
+    raw_path = str(request.scope.get("path") or "")
+    if raw_path != "/health":
+        direct_host = request.client.host if request.client else None
+        ip_address = trusted_client_ip(request.headers, direct_host)
+        if await backend_ip_is_blocked(ip_address):
+            return add_security_headers(
+                PlainTextResponse(
+                    "Access denied.",
+                    status_code=403,
+                    headers={"Cache-Control": "no-store"},
+                )
+            )
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            parsed_length = int(content_length)
+            oversized = parsed_length < 0 or parsed_length > MAX_PROXY_BODY_BYTES
+        except ValueError:
+            oversized = True
+        if oversized:
+            return add_security_headers(
+                PlainTextResponse("Request body is too large.", status_code=413)
+            )
+    return add_security_headers(await call_next(request))
+
+
+@app.get("/health")
+async def web_health() -> Response:
+    """Report unhealthy when the internal Streamlit server is unavailable."""
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            upstream = await client.get(f"{STREAMLIT_ORIGIN}/app/_stcore/health")
+    except httpx.RequestError:
+        return Response(
+            content='{"status":"unavailable","streamlit":false}',
+            status_code=503,
+            media_type="application/json",
+            headers={"Cache-Control": "no-store"},
+        )
+    status_code = 200 if upstream.status_code == 200 else 503
+    return Response(
+        content=json.dumps(
+            {"status": "ok" if status_code == 200 else "unavailable", "streamlit": status_code == 200}
+        ),
+        status_code=status_code,
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
+
 
 
 @app.get("/", response_class=HTMLResponse)

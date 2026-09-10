@@ -34,10 +34,6 @@ SHOW_HUMAN_HANDOFF_UI = os.getenv("DILSE_SHOW_HUMAN_HANDOFF_UI", "false").strip(
     "off",
 }
 REQUEST_TIMEOUT_SECONDS = 90
-AI_REPLY_MIN_DELAY_SECONDS = max(
-    0.0,
-    min(float(os.getenv("DILSE_AI_REPLY_MIN_DELAY_SECONDS", "2.5")), 10.0),
-)
 USER_TRANSCRIPT_PAGE_SIZE = 30
 ADMIN_TRANSCRIPT_PAGE_SIZE = 30
 BROWSER_SESSION_SECONDS = int(os.getenv("AUTH_SESSION_DAYS", "7")) * 24 * 60 * 60
@@ -46,6 +42,7 @@ CURRENT_TERMS_VERSION = "2026-08-10-terms-v6"
 CHARACTER_PROFILE_MIN_LENGTH = 12
 CHARACTER_PROFILE_MAX_WORDS = 5_000
 CHARACTER_PROFILE_MAX_CHARS = 75_000
+PREDEFINED_CHARACTER_PERSONAS = {"crush", "fantasy_partner"}
 ADMIN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 ADMIN_TTS_MAX_CHARACTERS = 600
 ACCOUNT_DELETION_REASONS = {
@@ -102,6 +99,16 @@ CHARACTER_PROFILE_GUIDANCE = {
         "question": "What tends to trigger their jealousy? How does it show up in their words, and what kind of reassurance do they respond to?",
         "placeholder": "Example: He becomes uneasy when plans change without notice and asks repeated questions. He speaks directly, dislikes vague answers, and calms down when expectations are discussed clearly.",
     },
+    "crush": {
+        "relationship": "your crush",
+        "question": "Crush already starts warm, curious, lightly flirtatious, and a little uncertain. Add any details you want DilSe to remember.",
+        "placeholder": "Optional: Add his name, speaking style, temperament, appearance, or anything that has already happened between you.",
+    },
+    "fantasy_partner": {
+        "relationship": "your fantasy partner",
+        "question": "Fantasy Partner already starts confident, attentive, affectionate, expressive, and playful. Add any details you want DilSe to remember.",
+        "placeholder": "Optional: Add his name, speaking style, appearance, setting, or the kind of connection you want to roleplay.",
+    },
     "mother_in_law": {
         "relationship": "your mother-in-law",
         "question": "What matters most to her? How does she speak, criticize, show care, or respond when a boundary is set?",
@@ -121,8 +128,6 @@ CHARACTER_PROFILE_GUIDANCE = {
 LANDING_IMAGE_PATH = Path(__file__).parent / "assets" / "dilse-woman-letter.webp"
 LOGO_PATH = Path(__file__).parent / "assets" / "dilse-logo.svg"
 CHAT_AVATAR_PATH = Path(__file__).parent / "assets" / "dilse-mark.svg"
-PHONE_ALERTS_PATH = Path(__file__).parent / "components" / "phone_alerts"
-phone_alerts_component = components.declare_component("dilse_phone_alerts", path=str(PHONE_ALERTS_PATH))
 LEGACY_LIVE_UPDATES_PATH = Path(__file__).parent / "components" / "live_updates"
 _legacy_live_updates_component = components.declare_component(
     "dilse_live_updates",
@@ -2436,30 +2441,6 @@ st.markdown(
         color: #60384a;
         font-size: .72rem;
     }
-    .v2-outcome-panel {
-        margin: .8rem 0 .5rem;
-        padding: .72rem .82rem;
-        border: 1px solid #e0d4d2;
-        border-radius: 16px;
-        background: rgba(255,253,249,.88);
-    }
-    .v2-outcome-panel strong { display: block; color: #473039; font-size: .78rem; }
-    .v2-outcome-panel span { color: #806b73; font-size: .68rem; }
-    .st-key-v2_outcome_actions .stButton button,
-    .st-key-v2_readiness_actions .stButton button {
-        min-height: 36px;
-        padding: .35rem .55rem;
-        border-radius: 999px;
-        font-size: .68rem;
-    }
-    .v2-readiness-question {
-        margin: .9rem 0 .45rem;
-        color: #4b343e;
-        font-size: .78rem;
-        font-weight: 720;
-        text-align: center;
-    }
-
     /* New conversation mode gate */
     .new-chat-mode-intro {
         width: min(100%, 880px);
@@ -4011,7 +3992,6 @@ def initialize_state() -> None:
         "transition_label": None,
         "conversation_checkpoint": None,
         "live_update_event_ids": {},
-        "phone_alert_event_id": None,
         "opened_push_session": None,
         "voice_recording_active": False,
         "voice_recording_pending_refresh": False,
@@ -4022,7 +4002,6 @@ def initialize_state() -> None:
         "mobile_conversation_settings_open": False,
         "scroll_dashboard_top": False,
         "scroll_chat_composer": False,
-        "v2_readiness_saved": {},
         "scroll_request_id": 0,
         "v2_partner_persona_slug": None,
         "v2_partner_persona_name": None,
@@ -5359,7 +5338,6 @@ def send_chat(
     roleplay_difficulty: str | None = None,
     reply_to_message_id: int | None = None,
 ) -> None:
-    reply_started_at = time.perf_counter()
     visible_history = [
         {"role": item["role"], "content": item["content"]}
         for item in st.session_state.messages[-20:]
@@ -5421,17 +5399,10 @@ def send_chat(
             st.session_state.transition_label = None
             waiting_for_admin = result.get("delivery") == "waiting_for_admin"
             if SHOW_HUMAN_HANDOFF_UI or not waiting_for_admin:
-                if result.get("delivery") == "ai":
-                    remaining_delay = AI_REPLY_MIN_DELAY_SECONDS - (
-                        time.perf_counter() - reply_started_at
-                    )
-                    if remaining_delay > 0:
-                        time.sleep(remaining_delay)
                 st.session_state.messages.append(
                     {
                         "role": "assistant",
                         "content": result["response"],
-                        "usage": result["prompt_tokens"] + result["completion_tokens"],
                         "stored": result["stored"],
                         "notice": waiting_for_admin,
                         "message_id": result.get("message_id"),
@@ -6372,6 +6343,10 @@ def character_profile_word_count(value: str | None) -> int:
     return len(str(value or "").split())
 
 
+def persona_has_predefined_character(persona_slug: str | None) -> bool:
+    return str(persona_slug or "") in PREDEFINED_CHARACTER_PERSONAS
+
+
 def character_profile_guidance(persona_slug: str, persona_name: str) -> dict[str, str]:
     guidance = CHARACTER_PROFILE_GUIDANCE.get(persona_slug)
     if guidance:
@@ -6514,7 +6489,7 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
     st.button(
         "Close settings",
         on_click=close_mobile_conversation_settings,
-        use_container_width=True,
+        width="stretch",
         key="mobile_close_conversation_settings",
     )
     st.markdown(
@@ -6534,7 +6509,7 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
             on_click=switch_conversation_mode,
             args=(switch_target,),
             key="intentional_mode_switch",
-            use_container_width=True,
+            width="stretch",
         )
     else:
         selected_mode = st.radio(
@@ -6584,8 +6559,9 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
             st.caption(selected_persona["description"])
 
             profile_copy = character_profile_guidance(persona_slug, persona_name)
+            has_predefined_character = persona_has_predefined_character(persona_slug)
             st.markdown(
-                f'<div class="character-profile-intro"><span>Character sketch</span><strong>Tell DilSe about {html.escape(profile_copy["relationship"])}</strong><p>{html.escape(profile_copy["question"])}</p></div>',
+                f'<div class="character-profile-intro"><span>{"Optional details" if has_predefined_character else "Character sketch"}</span><strong>{"Add to" if has_predefined_character else "Tell DilSe about"} {html.escape(profile_copy["relationship"])}</strong><p>{html.escape(profile_copy["question"])}</p></div>',
                 unsafe_allow_html=True,
             )
             profile_locked = bool(st.session_state.messages)
@@ -6609,9 +6585,12 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
                 f"{profile_word_count:,} / {CHARACTER_PROFILE_MAX_WORDS:,} words"
             )
             profile_ready = bool(
-                character_description
-                and len(character_description) >= CHARACTER_PROFILE_MIN_LENGTH
-                and profile_word_count <= CHARACTER_PROFILE_MAX_WORDS
+                has_predefined_character
+                or (
+                    character_description
+                    and len(character_description) >= CHARACTER_PROFILE_MIN_LENGTH
+                    and profile_word_count <= CHARACTER_PROFILE_MAX_WORDS
+                )
             )
             if profile_locked:
                 st.markdown(
@@ -6625,7 +6604,9 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
                 )
             elif profile_ready:
                 st.markdown(
-                    '<div class="character-profile-status ready">Character sketch ready. DilSe will use these details in every reply.</div>',
+                    '<div class="character-profile-status ready">Built-in character ready. You can add optional details here or in your first message.</div>'
+                    if has_predefined_character and not character_description
+                    else '<div class="character-profile-status ready">Character sketch ready. DilSe will use these details in every reply.</div>',
                     unsafe_allow_html=True,
                 )
             else:
@@ -6676,7 +6657,7 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
         with st.expander("Conversation actions"):
             if st.button(
                 "Delete this conversation",
-                use_container_width=True,
+                width="stretch",
                 key="setup_delete_conversation",
             ):
                 st.session_state.pending_delete_session_id = st.session_state.session_id
@@ -6687,14 +6668,14 @@ def render_conversation_setup(catalog: dict[str, list[dict[str, Any]]]) -> dict[
                 if confirm_col.button(
                     "Delete",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key="setup_confirm_delete_conversation",
                 ):
                     delete_current_conversation()
                     st.rerun()
                 if cancel_col.button(
                     "Keep it",
-                    use_container_width=True,
+                    width="stretch",
                     key="setup_cancel_delete_conversation",
                 ):
                     st.session_state.pending_delete_session_id = None
@@ -6732,7 +6713,7 @@ def render_conversation_setup_v2(
     st.button(
         "Close settings",
         on_click=close_mobile_conversation_settings,
-        use_container_width=True,
+        width="stretch",
         key="v2_mobile_close_conversation_settings",
     )
     mode = "listener" if st.session_state.mode == "The Listener" else "partner"
@@ -6752,7 +6733,7 @@ def render_conversation_setup_v2(
             on_click=switch_conversation_mode,
             args=(switch_target,),
             key="v2_intentional_mode_switch",
-            use_container_width=True,
+            width="stretch",
         )
 
     scenario_slug: str | None = None
@@ -6789,7 +6770,7 @@ def render_conversation_setup_v2(
                 st.button(
                     "Choose a different person",
                     on_click=clear_v2_partner_persona,
-                    use_container_width=True,
+                    width="stretch",
                     key="v2_change_persona",
                 )
         else:
@@ -6836,7 +6817,7 @@ def render_conversation_setup_v2(
         with st.expander("Conversation actions"):
             if st.button(
                 "Delete this conversation",
-                use_container_width=True,
+                width="stretch",
                 key="v2_setup_delete_conversation",
             ):
                 st.session_state.pending_delete_session_id = st.session_state.session_id
@@ -6847,14 +6828,14 @@ def render_conversation_setup_v2(
                 if confirm_col.button(
                     "Delete",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key="v2_setup_confirm_delete_conversation",
                 ):
                     delete_current_conversation()
                     st.rerun()
                 if cancel_col.button(
                     "Keep it",
-                    use_container_width=True,
+                    width="stretch",
                     key="v2_setup_cancel_delete_conversation",
                 ):
                     st.session_state.pending_delete_session_id = None
@@ -6906,7 +6887,7 @@ def render_new_chat_mode_gate() -> None:
                     on_click=choose_new_chat_mode,
                     args=("The Listener",),
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key="v2_new_chat_choose_listener",
                 )
             with partner_col:
@@ -6923,7 +6904,7 @@ def render_new_chat_mode_gate() -> None:
                     on_click=choose_new_chat_mode,
                     args=("The Partner",),
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                     key="v2_new_chat_choose_partner",
                 )
         return
@@ -6951,7 +6932,7 @@ def render_new_chat_mode_gate() -> None:
                 on_click=choose_new_chat_mode,
                 args=("The Listener",),
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="new_chat_choose_listener",
             )
         with partner_col:
@@ -6968,108 +6949,13 @@ def render_new_chat_mode_gate() -> None:
                 on_click=choose_new_chat_mode,
                 args=("The Partner",),
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="new_chat_choose_partner",
             )
     st.markdown(
         '<p class="new-chat-mode-note">You can start a different mode later without losing this conversation.</p>',
         unsafe_allow_html=True,
     )
-
-
-def render_v2_conversation_outcomes(
-    mode: str,
-    scenario_slug: str | None,
-    persona_slug: str | None,
-    roleplay_intensity: str | None,
-    character_description: str | None,
-    roleplay_difficulty: str | None,
-    latest_message_id: int | None,
-) -> None:
-    user_turns = sum(
-        1 for item in st.session_state.messages if item.get("role") == "user"
-    )
-    if user_turns < 2:
-        return
-    st.markdown(
-        '<div class="v2-outcome-panel"><strong>Turn this conversation into something useful</strong><span>Choose one, or keep writing normally.</span></div>',
-        unsafe_allow_html=True,
-    )
-    action_key = latest_message_id or len(st.session_state.messages)
-    action_prompts = [
-        (
-            "Create a message I can send",
-            "Based only on what I have told you, write one concise message I could send. Match my language and tone. Do not add facts.",
-        ),
-        (
-            "Give me 3 ways to say it",
-            "Give me three short ways to express my main point: gentle, direct, and firm. Preserve my meaning and language register.",
-        ),
-        (
-            "Make the practice harder" if mode == "partner" else "Give me one next step",
-            (
-                "Stay in character and respond with one believable, more resistant concern so I can practise answering it. Do not become abusive or resolve the issue for me."
-                if mode == "partner"
-                else "Give me one practical next step based on this conversation, followed by one sentence I could use."
-            ),
-        ),
-    ]
-    with st.container(
-        key="v2_outcome_actions",
-        horizontal=True,
-        horizontal_alignment="center",
-        vertical_alignment="center",
-        gap="small",
-    ):
-        for index, (label, prompt) in enumerate(action_prompts):
-            if st.button(label, key=f"v2_outcome_{action_key}_{index}"):
-                with st.spinner("DilSe is preparing this…"):
-                    send_chat(
-                        prompt,
-                        mode,
-                        scenario_slug,
-                        persona_slug,
-                        roleplay_intensity,
-                        character_description,
-                        "resistant" if mode == "partner" and index == 2 else roleplay_difficulty,
-                    )
-                st.rerun()
-
-    readiness_saved = dict(st.session_state.get("v2_readiness_saved") or {})
-    if readiness_saved.get(st.session_state.session_id):
-        st.caption("Your readiness check was saved. This conversation is already in My conversations.")
-        return
-    st.markdown(
-        '<div class="v2-readiness-question">Do you feel more ready for the real conversation?</div>',
-        unsafe_allow_html=True,
-    )
-    with st.container(
-        key="v2_readiness_actions",
-        horizontal=True,
-        horizontal_alignment="center",
-        vertical_alignment="center",
-        gap="small",
-    ):
-        readiness_options = (
-            ("Yes", "yes"),
-            ("A little", "a_little"),
-            ("Not yet", "not_yet"),
-        )
-        for label, value in readiness_options:
-            if st.button(label, key=f"v2_readiness_{action_key}_{value}"):
-                response = request_api(
-                    "POST",
-                    f"/sessions/{st.session_state.session_id}/readiness",
-                    {"readiness": value},
-                    auth=True,
-                )
-                if response.status_code == 201:
-                    readiness_saved[st.session_state.session_id] = value
-                    st.session_state.v2_readiness_saved = readiness_saved
-                    st.toast("Readiness check saved")
-                    st.rerun()
-                else:
-                    st.error(error_detail(response))
 
 
 def render_talk(
@@ -7128,6 +7014,7 @@ def render_talk(
         mode == "partner"
         and not st.session_state.messages
         and not partner_persona_required
+        and not persona_has_predefined_character(persona_slug)
         and (
             not character_description
             or len(str(character_description)) < CHARACTER_PROFILE_MIN_LENGTH
@@ -7141,7 +7028,7 @@ def render_talk(
         if mode == "partner":
             if partner_persona_required:
                 st.markdown(
-                    '<section class="v2-persona-intro"><span>First, choose the person</span><h2>Who should DilSe be?</h2><p>You will describe how this person normally speaks and reacts in the next step.</p></section>',
+                    '<section class="v2-persona-intro"><span>First, choose the person</span><h2>Who should DilSe be?</h2><p>Some characters have a built-in personality. You can add your own details before the first line.</p></section>',
                     unsafe_allow_html=True,
                 )
                 with st.container(
@@ -7173,8 +7060,19 @@ def render_talk(
                 )
             else:
                 roleplay_name = html.escape(str(persona_name or "your partner"))
+                predefined_character = persona_has_predefined_character(persona_slug)
+                roleplay_description = (
+                    "The built-in personality is ready. In this first message, you can add a name, speaking style, temperament, or setting, then say what you want to say."
+                    if predefined_character
+                    else "DilSe will use the character sketch and situation selected in Settings to reply more like the person you know."
+                )
+                roleplay_example = (
+                    'Try: “Your name is Ayaan and you are shy but funny. I have wanted to tell you something.”'
+                    if predefined_character
+                    else 'Try: “I want to tell you what I need tonight.”'
+                )
                 st.markdown(
-                    f'<section class="chat-empty partner-empty"><div class="empty-mark-dilse">D</div><div><span class="heartline">Partner mode · Explicit by default</span><h1>Say the first line to {roleplay_name}</h1><p>DilSe will use the character sketch and situation selected in Settings to reply more like the person you know.</p><small>Try: “I want to tell you what I need tonight.”</small></div></section>',
+                    f'<section class="chat-empty partner-empty"><div class="empty-mark-dilse">D</div><div><span class="heartline">Partner mode · Explicit by default</span><h1>Say the first line to {roleplay_name}</h1><p>{html.escape(roleplay_description)}</p><small>{html.escape(roleplay_example)}</small></div></section>',
                     unsafe_allow_html=True,
                 )
         else:
@@ -7210,7 +7108,7 @@ def render_talk(
                         label,
                         on_click=begin_with_intent,
                         args=("The Listener", starter),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"starter_{label}",
                     )
     if st.session_state.transition_label:
@@ -7284,117 +7182,6 @@ def render_talk(
             )
             if before_id is not None and load_earlier_user_messages(before_id):
                 st.rerun(scope="app")
-
-    latest_assistant = next(
-        (item for item in reversed(st.session_state.messages) if item.get("role") == "assistant" and not item.get("error")),
-        None,
-    )
-    if latest_assistant:
-        with st.expander("Response options"):
-            st.caption("Adjust only the latest reply")
-            shorter_col, direct_col, voice_col = st.columns(3)
-            refinement: str | None = None
-            if shorter_col.button("Shorter", use_container_width=True, key="refine_shorter"):
-                refinement = "Rewrite your last response more briefly. Preserve every fact, the current mode, and my language register."
-            if direct_col.button("More direct", use_container_width=True, key="refine_direct"):
-                refinement = "Rewrite your last response more directly without becoming harsher or changing the facts."
-            voice_label = "Sound like me" if mode == "listener" else "More natural"
-            if voice_col.button(voice_label, use_container_width=True, key="refine_voice"):
-                refinement = (
-                    "Rewrite your last response in words I could naturally say, matching my language and aap or tum register."
-                    if mode == "listener"
-                    else "Rewrite the last character response as shorter, more natural spoken dialogue while preserving the character and facts."
-                )
-            if refinement:
-                with st.spinner("DilSe is adjusting the response…"):
-                    send_chat(
-                        refinement,
-                        mode,
-                        scenario_slug,
-                        persona_slug,
-                        roleplay_intensity,
-                        character_description,
-                        roleplay_difficulty,
-                    )
-                st.rerun()
-
-            if latest_assistant.get("message_id"):
-                st.divider()
-                st.caption("Report what did not fit")
-                with st.form(f"message_feedback_{latest_assistant['message_id']}"):
-                    category_label = st.selectbox(
-                        "What was off?",
-                        ["Wrong facts", "Too conclusive", "Wrong language", "Too long", "Wrong tone", "Not my voice"],
-                    )
-                    feedback_note = st.text_input("Optional detail")
-                    save_feedback = st.form_submit_button("Save feedback")
-                if save_feedback:
-                    category_map = {
-                        "Wrong facts": "wrong_facts",
-                        "Too conclusive": "too_conclusive",
-                        "Wrong language": "wrong_language",
-                        "Too long": "too_long",
-                        "Wrong tone": "wrong_tone",
-                        "Not my voice": "not_my_voice",
-                    }
-                    response = request_api(
-                        "POST",
-                        f"/messages/{latest_assistant['message_id']}/feedback",
-                        {"category": category_map[category_label], "notes": feedback_note or None},
-                        auth=True,
-                    )
-                    if response.status_code == 201:
-                        st.success("Feedback saved for review.")
-                    else:
-                        st.error(error_detail(response))
-
-    if experience_v2 and latest_assistant:
-        render_v2_conversation_outcomes(
-            mode,
-            scenario_slug,
-            persona_slug,
-            roleplay_intensity,
-            character_description,
-            roleplay_difficulty,
-            int(latest_assistant.get("message_id") or 0) or None,
-        )
-
-    checkpoint = st.session_state.conversation_checkpoint
-    if experience_v2 and not checkpoint and st.session_state.messages:
-        try:
-            memory_response = request_api(
-                "GET",
-                f"/sessions/{st.session_state.session_id}/state",
-                auth=True,
-                timeout=8,
-            )
-            if memory_response.status_code == 200:
-                checkpoint = memory_response.json()
-        except requests.RequestException:
-            checkpoint = None
-    if checkpoint:
-        with st.expander("Review what DilSe remembers", expanded=False):
-            st.caption("Open this only when you want to check or correct the conversation memory.")
-            with st.form(f"checkpoint_{checkpoint['turn_count']}"):
-                confirmed_summary = st.text_area(
-                    "What DilSe remembers",
-                    value=str(checkpoint["summary"]),
-                    height=150,
-                )
-                confirm_summary = st.form_submit_button("Save memory", type="primary")
-            if confirm_summary:
-                response = request_api(
-                    "PUT",
-                    f"/sessions/{st.session_state.session_id}/state",
-                    {"summary": confirmed_summary},
-                    auth=True,
-                )
-                if response.status_code == 200:
-                    st.session_state.conversation_checkpoint = None
-                    st.success("Conversation memory updated.")
-                    st.rerun()
-                else:
-                    st.error(error_detail(response))
 
     if st.session_state.pending_prompt:
         pending = st.session_state.pending_prompt
@@ -7476,7 +7263,12 @@ def render_talk(
         )
     else:
         prompt_placeholder = (
-            f"Say something to {persona_name or 'the character'}…"
+            (
+                f"Add optional details, then say something to {persona_name or 'the character'}…"
+                if persona_has_predefined_character(persona_slug)
+                and not st.session_state.messages
+                else f"Say something to {persona_name or 'the character'}…"
+            )
             if mode == "partner"
             else "Message DilSe…"
         )
@@ -7514,6 +7306,15 @@ def render_talk(
             st.toast("Character sketch saved. Start the conversation when you are ready.")
             st.rerun()
     elif prompt:
+        if (
+            mode == "partner"
+            and not st.session_state.messages
+            and persona_has_predefined_character(persona_slug)
+            and not character_description
+        ):
+            character_description = str(prompt).strip()
+            st.session_state.character_description = character_description
+            st.session_state.partner_profile_editor_sync = True
         reply_to_message_id = (
             int(selected_reply["message_id"])
             if selected_reply.get("session_id") == st.session_state.session_id
@@ -7621,7 +7422,7 @@ def render_exercises(catalog: dict[str, list[dict[str, Any]]]) -> None:
                                 f"Please guide me through this exercise: {name}. {starter}"
                             ),
                             type="primary",
-                            use_container_width=True,
+                            width="stretch",
                         )
 
     with card_tab:
@@ -7646,7 +7447,7 @@ def render_exercises(catalog: dict[str, list[dict[str, Any]]]) -> None:
                 unsafe_allow_html=True,
             )
             draw_col, talk_col = st.columns([1, 1.7])
-            if draw_col.button("Draw another", use_container_width=True, key="draw_card"):
+            if draw_col.button("Draw another", width="stretch", key="draw_card"):
                 alternatives = [item for item in cards if item != card]
                 st.session_state.current_card = random.choice(alternatives or cards)
                 st.rerun()
@@ -7656,7 +7457,7 @@ def render_exercises(catalog: dict[str, list[dict[str, Any]]]) -> None:
                     f"Please help me think through this conversation card: {card['starter']}"
                 ),
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="start_card_chat",
             )
 
@@ -7703,14 +7504,14 @@ def render_conversations() -> None:
             "Review privacy settings",
             on_click=set_main_page,
             args=("Privacy",),
-            use_container_width=True,
+            width="stretch",
             key="history_open_privacy",
         )
         chat_col.button(
             "Start a private chat",
             on_click=reset_local_conversation,
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="history_start_unstored_chat",
         )
         return
@@ -7736,7 +7537,7 @@ def render_conversations() -> None:
             "Start your first conversation",
             on_click=reset_local_conversation,
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="history_start_first_chat",
         )
         return
@@ -7807,7 +7608,7 @@ def render_conversations() -> None:
                     "Remove permanently",
                     key=f"confirm_delete_saved_{session_id}",
                     type="primary",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     delete_response = request_api(
                         "DELETE", f"/sessions/{session_id}", auth=True, timeout=10
@@ -7825,7 +7626,7 @@ def render_conversations() -> None:
                 if cancel_col.button(
                     "Keep it",
                     key=f"cancel_delete_saved_{session_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state.pending_delete_session_id = None
                     st.rerun()
@@ -7864,7 +7665,7 @@ def render_privacy() -> None:
     submitted = st.button(
         "Save data settings",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="save_privacy_choices",
     )
     if submitted:
@@ -7910,58 +7711,153 @@ def render_phone_alert_settings() -> None:
         st.info("Phone alerts are being prepared. Email reminders will continue.")
         return
 
+    widget_id = f"dilse-phone-alerts-{int(st.session_state.user['id'])}"
     with st.container(key="phone_alerts_widget"):
-        event = phone_alerts_component(
-            public_key=str(config["public_key"]),
-            sw_url="/component/app.dilse_phone_alerts/push-sw.js",
-            default=None,
-            key=f"phone_alerts_{st.session_state.user['id']}",
-            tab_index=0,
-        )
-    if not isinstance(event, dict) or not event.get("event_id"):
-        st.caption(
-            "Chrome controls the sound and may group notifications. DilSe never includes conversation text in a phone alert."
-        )
-        return
-    event_id = str(event["event_id"])
-    if st.session_state.phone_alert_event_id == event_id:
-        return
-    st.session_state.phone_alert_event_id = event_id
+        st.html(
+            f"""<style>
+            * {{ box-sizing: border-box; }}
+            body {{ margin: 0; color: #2e2026; background: transparent; font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif; }}
+            .alert-card {{ display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 92px; padding: 14px 16px; border: 1px solid #dac5ca; border-radius: 18px; background: linear-gradient(120deg, #fffdf9 0%, #f5e9ea 100%); }}
+            .bell {{ display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; color: #fffdf9; background: #571f35; font-size: 20px; box-shadow: 0 0 0 5px rgba(184, 92, 115, .12); }}
+            .copy strong {{ display: block; font-size: 15px; line-height: 1.25; }}
+            .copy span {{ display: block; margin-top: 4px; color: #715d65; font-size: 12px; line-height: 1.35; }}
+            .alert-card button {{ min-height: 38px; padding: 9px 15px; border: 1px solid #571f35; border-radius: 999px; color: #fffdf9; background: #571f35; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }}
+            .alert-card button.secondary {{ color: #571f35; background: transparent; }}
+            .alert-card button:disabled {{ cursor: wait; opacity: .62; }}
+            @media (max-width: 480px) {{ .alert-card {{ grid-template-columns: 38px 1fr; padding: 13px; }} .bell {{ width: 38px; height: 38px; }} .alert-card button {{ grid-column: 1 / -1; width: 100%; }} }}
+            </style>
+            <div id="{widget_id}" class="alert-card" role="group" aria-label="Phone response alerts">
+                <div class="bell" aria-hidden="true">&#128276;</div>
+                <div class="copy"><strong data-title>Checking this browser…</strong><span data-copy>Alerts contain no conversation details.</span></div>
+                <button data-action disabled>Checking…</button>
+            </div>
+            <script>
+            (() => {{
+                const root = document.getElementById({json.dumps(widget_id)});
+                if (!root) return;
+                const title = root.querySelector("[data-title]");
+                const copy = root.querySelector("[data-copy]");
+                const button = root.querySelector("[data-action]");
+                const publicKey = {json.dumps(str(config["public_key"]))};
+                const userToken = {json.dumps(str(st.session_state.auth_token or ""))};
+                let currentSubscription = null;
 
-    action = str(event.get("action") or "")
-    try:
-        if action == "subscribe":
-            subscription = event.get("subscription") or {}
-            keys = subscription.get("keys") or {}
-            save_response = request_api(
-                "POST",
-                "/account/push/subscriptions",
-                {
-                    "endpoint": str(subscription.get("endpoint") or ""),
-                    "p256dh": str(keys.get("p256dh") or ""),
-                    "auth": str(keys.get("auth") or ""),
-                },
-                auth=True,
-                timeout=15,
-            )
-            if save_response.status_code == 201:
-                st.toast("Phone alerts enabled for this browser")
-            else:
-                st.error(error_detail(save_response))
-        elif action == "unsubscribe":
-            remove_response = request_api(
-                "POST",
-                "/account/push/unsubscribe",
-                {"endpoint": str(event.get("endpoint") or "")},
-                auth=True,
-                timeout=15,
-            )
-            if remove_response.status_code == 200:
-                st.toast("Phone alerts turned off for this browser")
-            else:
-                st.error(error_detail(remove_response))
-    except requests.RequestException:
-        st.error("Phone alert settings could not be saved. Check your connection and try again.")
+                const urlBase64ToUint8Array = (value) => {{
+                    const padding = "=".repeat((4 - value.length % 4) % 4);
+                    const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+                    const raw = atob(base64);
+                    return Uint8Array.from([...raw].map((character) => character.charCodeAt(0)));
+                }};
+                const activatedRegistration = async () => {{
+                    const registration = await window.parent.navigator.serviceWorker.register(
+                        "/site/dilse-push-sw.js"
+                    );
+                    if (registration.active) return registration;
+                    const worker = registration.installing || registration.waiting;
+                    if (!worker) return registration;
+                    await new Promise((resolve, reject) => {{
+                        const timeout = window.setTimeout(
+                            () => reject(new Error("Service worker activation timed out")),
+                            10000
+                        );
+                        worker.addEventListener("statechange", () => {{
+                            if (worker.state === "activated") {{
+                                window.clearTimeout(timeout);
+                                resolve();
+                            }}
+                        }});
+                    }});
+                    return registration;
+                }};
+                const postAccountEvent = (path, payload) => window.parent.fetch(
+                    `/api/account/push/${{path}}`,
+                    {{
+                        method: "POST",
+                        headers: {{
+                            "Content-Type": "application/json",
+                            "X-User-Token": userToken
+                        }},
+                        credentials: "same-origin",
+                        cache: "no-store",
+                        body: JSON.stringify(payload)
+                    }}
+                );
+                const render = () => {{
+                    const unsupported = !("Notification" in window.parent) ||
+                        !("serviceWorker" in window.parent.navigator) ||
+                        !("PushManager" in window.parent);
+                    if (unsupported) {{
+                        title.textContent = "Phone alerts are not supported here";
+                        copy.textContent = "Use current Chrome on Android, or keep email reminders enabled.";
+                        button.textContent = "Unavailable";
+                        button.disabled = true;
+                        return;
+                    }}
+                    if (window.parent.Notification.permission === "denied") {{
+                        title.textContent = "Phone alerts are blocked in Chrome";
+                        copy.textContent = "Open this site's Chrome permissions to allow notifications.";
+                        button.textContent = "Blocked";
+                        button.disabled = true;
+                    }} else if (currentSubscription) {{
+                        title.textContent = "Phone alerts are on for this browser";
+                        copy.textContent = "A private DilSe alert will sound when a response arrives in the background.";
+                        button.textContent = "Turn off";
+                        button.className = "secondary";
+                        button.disabled = false;
+                    }} else {{
+                        title.textContent = "Hear when DilSe replies";
+                        copy.textContent = "One tap lets Android play its normal notification sound. No message text is shown.";
+                        button.textContent = "Allow alerts";
+                        button.className = "";
+                        button.disabled = false;
+                    }}
+                }};
+                const initialize = async () => {{
+                    try {{
+                        const registration = await activatedRegistration();
+                        currentSubscription = await registration.pushManager.getSubscription();
+                    }} catch (_) {{
+                        currentSubscription = null;
+                    }}
+                    render();
+                }};
+                button.addEventListener("click", async () => {{
+                    button.disabled = true;
+                    try {{
+                        const registration = await activatedRegistration();
+                        currentSubscription = await registration.pushManager.getSubscription();
+                        if (currentSubscription) {{
+                            const endpoint = currentSubscription.endpoint;
+                            const response = await postAccountEvent("unsubscribe", {{ endpoint }});
+                            if (!response.ok) throw new Error("Subscription removal failed");
+                            await currentSubscription.unsubscribe();
+                            currentSubscription = null;
+                        }} else {{
+                            const permission = await window.parent.Notification.requestPermission();
+                            if (permission !== "granted") {{ render(); return; }}
+                            currentSubscription = await registration.pushManager.subscribe({{
+                                userVisibleOnly: true,
+                                applicationServerKey: urlBase64ToUint8Array(publicKey)
+                            }});
+                            const subscription = currentSubscription.toJSON();
+                            const response = await postAccountEvent("subscriptions", {{
+                                endpoint: String(subscription.endpoint || ""),
+                                p256dh: String(subscription.keys?.p256dh || ""),
+                                auth: String(subscription.keys?.auth || "")
+                            }});
+                            if (!response.ok) throw new Error("Subscription save failed");
+                        }}
+                    }} catch (_) {{
+                        title.textContent = "Phone alerts could not be changed";
+                        copy.textContent = "Check Chrome notification permissions and try again.";
+                    }}
+                    render();
+                }});
+                void initialize();
+            }})();
+            </script>""",
+            unsafe_allow_javascript=True,
+        )
     st.caption(
         "Chrome controls the sound and may group notifications. DilSe never includes conversation text in a phone alert."
     )
@@ -7982,7 +7878,7 @@ def render_account() -> None:
         "Privacy and data controls",
         on_click=set_main_page,
         args=("Privacy",),
-        use_container_width=True,
+        width="stretch",
         key="account_open_privacy",
     )
 
@@ -8021,7 +7917,7 @@ def render_account() -> None:
     if st.button(
         "Save response preferences",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="save_account_preferences",
     ):
         try:
@@ -8064,7 +7960,7 @@ def render_account() -> None:
     )
     if st.button(
         "Save email preference",
-        use_container_width=True,
+        width="stretch",
         key="save_email_notification_preference",
     ):
         try:
@@ -8184,7 +8080,7 @@ def render_left_rail() -> None:
         "+ New chat",
         on_click=reset_local_conversation,
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="rail_new_conversation",
     )
 
@@ -8225,7 +8121,7 @@ def render_left_rail() -> None:
             on_click=set_main_page,
             args=(page,),
             type="primary" if st.session_state.page == page else "secondary",
-            use_container_width=True,
+            width="stretch",
             key=f"rail_page_{page}",
         )
 
@@ -8238,10 +8134,10 @@ def render_left_rail() -> None:
         "Settings and privacy",
         on_click=set_main_page,
         args=("Account",),
-        use_container_width=True,
+        width="stretch",
         key="rail_account_settings",
     )
-    st.button("Sign out", on_click=sign_out, use_container_width=True, key="rail_signout")
+    st.button("Sign out", on_click=sign_out, width="stretch", key="rail_signout")
 
 
 def render_account_panel() -> None:
@@ -8260,17 +8156,17 @@ def render_account_panel() -> None:
         "Privacy settings",
         on_click=set_main_page,
         args=("Privacy",),
-        use_container_width=True,
+        width="stretch",
         key=f"account_privacy_{st.session_state.page}",
     )
     st.button(
         "Account",
         on_click=set_main_page,
         args=("Account",),
-        use_container_width=True,
+        width="stretch",
         key=f"account_page_{st.session_state.page}",
     )
-    st.button("Sign out", on_click=sign_out, use_container_width=True, key=f"account_signout_{st.session_state.page}")
+    st.button("Sign out", on_click=sign_out, width="stretch", key=f"account_signout_{st.session_state.page}")
 
 
 def render_secondary_context() -> None:
@@ -8309,7 +8205,7 @@ def render_secondary_context() -> None:
         on_click=set_main_page,
         args=("Talk",),
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key=f"context_back_to_chat_{st.session_state.page}",
     )
     render_account_panel()
@@ -8323,6 +8219,31 @@ def render_mobile_navigation() -> None:
         vertical_alignment="center",
         gap="small",
     ):
+        if st.session_state.page == "Talk":
+            st.button(
+                "New",
+                on_click=reset_local_conversation,
+                key="mobile_nav_new_chat",
+            )
+            st.button(
+                "Chats",
+                on_click=set_main_page,
+                args=("My conversations",),
+                key="mobile_nav_history",
+            )
+            st.button(
+                "Practice",
+                on_click=set_main_page,
+                args=("Exercises",),
+                key="mobile_nav_practice",
+            )
+            st.button(
+                "Account",
+                on_click=set_main_page,
+                args=("Account",),
+                key="mobile_nav_settings",
+            )
+            return
         st.button(
             "Chat",
             on_click=set_main_page,
@@ -8626,7 +8547,7 @@ def render_admin() -> None:
         kind = st.selectbox("Content type", ["personas", "scenarios", "exercises", "cards"])
         response = request_api("GET", f"/admin/catalog/{kind}", admin=True)
         items = response.json() if response.status_code == 200 else []
-        st.dataframe(items, use_container_width=True, hide_index=True)
+        st.dataframe(items, width="stretch", hide_index=True)
         with st.form("catalog_form"):
             slug = st.text_input("Slug", help="Lowercase letters, numbers, and underscores.")
             name = st.text_input("Name")
@@ -8643,14 +8564,14 @@ def render_admin() -> None:
         corrections_response = request_api("GET", "/admin/corrections", admin=True)
         feedback_response = request_api("GET", "/admin/feedback", admin=True)
         st.subheader("Corrections")
-        st.dataframe(corrections_response.json() if corrections_response.status_code == 200 else [], use_container_width=True, hide_index=True)
+        st.dataframe(corrections_response.json() if corrections_response.status_code == 200 else [], width="stretch", hide_index=True)
         st.subheader("Admin notes")
-        st.dataframe(notes_response.json() if notes_response.status_code == 200 else [], use_container_width=True, hide_index=True)
+        st.dataframe(notes_response.json() if notes_response.status_code == 200 else [], width="stretch", hide_index=True)
         st.subheader("Roleplay feedback")
-        st.dataframe(feedback_response.json() if feedback_response.status_code == 200 else [], use_container_width=True, hide_index=True)
+        st.dataframe(feedback_response.json() if feedback_response.status_code == 200 else [], width="stretch", hide_index=True)
     with audit_tab:
         response = request_api("GET", "/admin/audit", admin=True)
-        st.dataframe(response.json() if response.status_code == 200 else [], use_container_width=True, hide_index=True)
+        st.dataframe(response.json() if response.status_code == 200 else [], width="stretch", hide_index=True)
 
 
 def admin_json(method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 20) -> Any | None:
@@ -8684,7 +8605,7 @@ def render_admin_workspace() -> None:
         with centre:
             with st.form("admin_login_v2"):
                 key = st.text_input("Admin API key", type="password")
-                submitted = st.form_submit_button("Open control room", type="primary", use_container_width=True)
+                submitted = st.form_submit_button("Open control room", type="primary", width="stretch")
             if submitted:
                 st.session_state.admin_key = key
                 st.rerun()
@@ -8697,7 +8618,7 @@ def render_admin_workspace() -> None:
 
     lock_col, rule_col = st.columns([1, 5])
     with lock_col:
-        if st.button("Lock workspace", use_container_width=True):
+        if st.button("Lock workspace", width="stretch"):
             st.session_state.admin_key = None
             st.rerun()
     with rule_col:
@@ -8825,7 +8746,7 @@ def render_admin_workspace() -> None:
                                         key=f"open_admin_chat_{user_id}_{item['session_id']}",
                                         type="primary" if is_open else "secondary",
                                         disabled=is_open,
-                                        use_container_width=True,
+                                        width="stretch",
                                     ):
                                         st.session_state[selected_session_key] = item["session_id"]
                                         st.rerun()
@@ -8898,7 +8819,7 @@ def render_admin_workspace() -> None:
 
                             if control_mode == "human":
                                 st.markdown('<span class="admin-status live">Human control active</span>', unsafe_allow_html=True)
-                                if st.button("Return replies to AI", type="primary", use_container_width=True, key=f"release_{session_id}"):
+                                if st.button("Return replies to AI", type="primary", width="stretch", key=f"release_{session_id}"):
                                     result = admin_json("POST", f"/admin/sessions/{session_id}/control", {"mode": "ai", "note": "Returned to AI from case desk"})
                                     if result is not None:
                                         st.success("AI replies resumed.")
@@ -8908,7 +8829,7 @@ def render_admin_workspace() -> None:
                                 if st.button(
                                     "Intervene in this chat",
                                     type="primary",
-                                    use_container_width=True,
+                                    width="stretch",
                                     disabled=not can_intervene,
                                     key=f"intervene_{session_id}",
                                 ):
@@ -8922,7 +8843,7 @@ def render_admin_workspace() -> None:
                             if control_mode == "human":
                                 with st.form(f"human_reply_{session_id}"):
                                     human_reply = st.text_area("Labelled human response")
-                                    send_reply = st.form_submit_button("Send human response", type="primary", use_container_width=True)
+                                    send_reply = st.form_submit_button("Send human response", type="primary", width="stretch")
                                 if send_reply:
                                     result = admin_json("POST", f"/admin/sessions/{session_id}/messages", {"content": human_reply})
                                     if result is not None:
@@ -8948,7 +8869,7 @@ def render_admin_workspace() -> None:
                                         help="The administrator can change this during the session. It applies to the next AI response.",
                                     )
                                     roleplay_note = st.text_input("Reason for roleplay change")
-                                    save_roleplay_controls = st.form_submit_button("Save roleplay controls", use_container_width=True)
+                                    save_roleplay_controls = st.form_submit_button("Save roleplay controls", width="stretch")
                                 if save_roleplay_controls:
                                     result = admin_json(
                                         "POST",
@@ -8980,7 +8901,7 @@ def render_admin_workspace() -> None:
                                 )
                                 session_note = st.text_input("Reason", value=session_control.get("note") or "", key=f"session_note_{session_id}")
                                 clear_session = st.checkbox("Remove session guidance", key=f"clear_session_{session_id}")
-                                save_session = st.form_submit_button("Save session guidance", use_container_width=True)
+                                save_session = st.form_submit_button("Save session guidance", width="stretch")
                             if save_session:
                                 result = admin_json(
                                     "POST",
@@ -9006,7 +8927,7 @@ def render_admin_workspace() -> None:
                                 )
                                 user_note = st.text_input("Reason for account guidance", value=user_prompt_control.get("note") or "")
                                 clear_user_prompt = st.checkbox("Remove account guidance")
-                                save_user_prompt = st.form_submit_button("Save account guidance", use_container_width=True)
+                                save_user_prompt = st.form_submit_button("Save account guidance", width="stretch")
                             if save_user_prompt:
                                 result = admin_json(
                                     "POST",
@@ -9094,18 +9015,18 @@ def render_admin_workspace() -> None:
         feedback_col.metric("Roleplay feedback records", len(feedback))
         response_feedback_col.metric("Response issues", len(message_feedback))
         st.subheader("Better-response library")
-        st.dataframe(corrections, use_container_width=True, hide_index=True)
+        st.dataframe(corrections, width="stretch", hide_index=True)
         st.subheader("Private review notes")
-        st.dataframe(notes, use_container_width=True, hide_index=True)
+        st.dataframe(notes, width="stretch", hide_index=True)
         st.subheader("User feedback")
-        st.dataframe(feedback, use_container_width=True, hide_index=True)
+        st.dataframe(feedback, width="stretch", hide_index=True)
         st.subheader("Per-response issues")
-        st.dataframe(message_feedback, use_container_width=True, hide_index=True)
+        st.dataframe(message_feedback, width="stretch", hide_index=True)
 
     with library:
         kind = st.selectbox("Content type", ["personas", "scenarios", "exercises", "cards"], key="v2_library_kind")
         items = admin_json("GET", f"/admin/catalog/{kind}") or []
-        st.dataframe(items, use_container_width=True, hide_index=True)
+        st.dataframe(items, width="stretch", hide_index=True)
         with st.form("v2_catalog_form"):
             slug = st.text_input("Slug", help="Use lowercase letters, numbers, and underscores.")
             name = st.text_input("Name")
@@ -9432,7 +9353,7 @@ def render_admin_left_rail(summary: dict[str, Any], active_count: int) -> None:
             label,
             key=f"admin_nav_{page}",
             type="primary" if st.session_state.admin_page == page else "secondary",
-            use_container_width=True,
+            width="stretch",
         ):
             admin_go_to(page)
     st.markdown('<div class="admin-rail-label">Improve DilSe</div>', unsafe_allow_html=True)
@@ -9527,7 +9448,7 @@ def admin_user_card(user: dict[str, Any], *, button_label: str, button_key: str)
                 unsafe_allow_html=True,
             )
         with action_col:
-            return st.button(button_label, key=button_key, use_container_width=True)
+            return st.button(button_label, key=button_key, width="stretch")
 
 
 def render_admin_overview(summary: dict[str, Any], users: list[dict[str, Any]], active: list[dict[str, Any]]) -> dict[str, Any]:
@@ -9881,7 +9802,7 @@ def render_admin_app_usage() -> dict[str, Any]:
                 "Last app message": admin_time(user.get("last_android_message")),
             }
         )
-    st.dataframe(table_rows, use_container_width=True, hide_index=True)
+    st.dataframe(table_rows, width="stretch", hide_index=True)
     return {"summary": summary}
 
 
@@ -10248,7 +10169,7 @@ def render_admin_message_delete_control(
         if confirm_col.button(
             "Delete permanently",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key=f"confirm_delete_message_{delete_target}",
         ):
             result = admin_json(
@@ -10428,7 +10349,7 @@ def render_admin_transcript_composer(
             if st.button(
                 "Take human control to reply",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 disabled=not bool(detail.get("can_intervene")),
                 key=f"admin_composer_intervene_{selected_session_id}",
             ):
@@ -11332,7 +11253,7 @@ def render_admin_quality() -> dict[str, Any]:
     rows = records[view]
     st.markdown(f'<div class="admin-section-title"><h2>{html.escape(view)}</h2><p>Newest records appear first.</p></div>', unsafe_allow_html=True)
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info(f"No {view.lower()} have been recorded.")
     return {"records": records, "quality_view": view}
@@ -11401,7 +11322,7 @@ def render_admin_audit() -> dict[str, Any]:
     ]
     st.caption(f"{len(filtered)} of {len(rows)} audit records")
     if filtered:
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        st.dataframe(filtered, width="stretch", hide_index=True)
     else:
         st.info("No audit records match these filters.")
     revisions = admin_json("GET", "/admin/message-revisions?limit=200") or []
@@ -11410,7 +11331,7 @@ def render_admin_audit() -> dict[str, Any]:
         unsafe_allow_html=True,
     )
     if revisions:
-        st.dataframe(revisions, use_container_width=True, hide_index=True)
+        st.dataframe(revisions, width="stretch", hide_index=True)
     else:
         st.info("No administrator message reviews have been recorded.")
     return {"audit": filtered, "message_revisions": revisions}
@@ -11452,7 +11373,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
     if control_mode == "human":
         st.markdown('<span class="admin-status live">Human control active</span>', unsafe_allow_html=True)
         st.caption("Write messages, attach images, and reply to a specific message below the transcript.")
-        if st.button("Return replies to AI", type="primary", use_container_width=True, key=f"v3_release_{session_id}"):
+        if st.button("Return replies to AI", type="primary", width="stretch", key=f"v3_release_{session_id}"):
             if admin_json("POST", f"/admin/sessions/{session_id}/control", {"mode": "ai", "note": "Returned to AI from administrator workspace"}) is not None:
                 st.success("AI replies resumed.")
                 st.rerun()
@@ -11465,15 +11386,15 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
                 "will also start in human control. Existing conversations keep their current setting."
             )
             confirm_col, cancel_col = st.columns(2)
-            if confirm_col.button("Confirm", type="primary", use_container_width=True, key=f"v3_confirm_intervene_{session_id}"):
+            if confirm_col.button("Confirm", type="primary", width="stretch", key=f"v3_confirm_intervene_{session_id}"):
                 if admin_json("POST", f"/admin/sessions/{session_id}/control", {"mode": "human", "note": "Human intervention from administrator workspace"}) is not None:
                     st.session_state.admin_pending_intervention = None
                     st.success("Human control is active.")
                     st.rerun()
-            if cancel_col.button("Cancel", use_container_width=True, key=f"v3_cancel_intervene_{session_id}"):
+            if cancel_col.button("Cancel", width="stretch", key=f"v3_cancel_intervene_{session_id}"):
                 st.session_state.admin_pending_intervention = None
                 st.rerun()
-        elif st.button("Take human control", type="primary", use_container_width=True, disabled=not can_intervene, key=f"v3_intervene_{session_id}"):
+        elif st.button("Take human control", type="primary", width="stretch", disabled=not can_intervene, key=f"v3_intervene_{session_id}"):
             st.session_state.admin_pending_intervention = session_id
             st.rerun()
         if not can_intervene:
@@ -11489,7 +11410,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
                 current_intimacy = str(control.get("roleplay_intensity_override") or "").title()
                 intimacy = st.selectbox("Intimacy detail", intimacy_options, index=intimacy_options.index(current_intimacy) if current_intimacy in intimacy_options else 0)
                 note = st.text_input("Reason for change", key=f"v3_roleplay_note_{session_id}")
-                save = st.form_submit_button("Save roleplay settings", use_container_width=True)
+                save = st.form_submit_button("Save roleplay settings", width="stretch")
             if save:
                 payload = {
                     "mode": control_mode,
@@ -11508,7 +11429,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
             prompt = st.text_area("Instruction for this session", value=control.get("prompt_override") or "", height=150)
             note = st.text_input("Reason", value=control.get("note") or "", key=f"v3_session_note_{session_id}")
             clear = st.checkbox("Remove session guidance", key=f"v3_clear_session_{session_id}")
-            save = st.form_submit_button("Save session guidance", use_container_width=True)
+            save = st.form_submit_button("Save session guidance", width="stretch")
         if save:
             payload = {"mode": control_mode, "prompt_override": prompt or None, "clear_prompt_override": clear, "note": note}
             if admin_json("POST", f"/admin/sessions/{session_id}/control", payload) is not None:
@@ -11520,7 +11441,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
             prompt = st.text_area("Instruction for this user", value=user_control.get("prompt_override") or "", height=150)
             note = st.text_input("Reason", value=user_control.get("note") or "", key=f"v3_user_note_{user_id}")
             clear = st.checkbox("Remove user guidance", key=f"v3_clear_user_{user_id}")
-            save = st.form_submit_button("Save user guidance", use_container_width=True)
+            save = st.form_submit_button("Save user guidance", width="stretch")
         if save:
             payload = {"prompt_override": prompt or None, "clear_prompt_override": clear, "note": note}
             if admin_json("POST", f"/admin/users/{user_id}/prompt-control", payload) is not None:
@@ -11530,7 +11451,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
     with st.expander("Review note"):
         with st.form(f"v3_note_{session_id}"):
             note = st.text_area("Private note")
-            save = st.form_submit_button("Save private note", use_container_width=True)
+            save = st.form_submit_button("Save private note", width="stretch")
         if save:
             if admin_json("POST", "/admin/notes", {"session_id": session_id, "message_id": None, "note": note}) is not None:
                 st.success("Private note saved.")
@@ -11543,7 +11464,7 @@ def render_admin_case_controls(context: dict[str, Any]) -> None:
                 message_label = st.selectbox("AI response", tuple(options))
                 category = st.selectbox("Issue type", ("cultural guidance", "safety", "tone", "language", "roleplay fidelity", "too verbose", "missed user request"))
                 better = st.text_area("Better response", height=170)
-                save = st.form_submit_button("Save better response", use_container_width=True)
+                save = st.form_submit_button("Save better response", width="stretch")
             if save:
                 payload = {"message_id": options[message_label]["id"], "category": category, "corrected_response": better}
                 if admin_json("POST", "/admin/corrections", payload) is not None:
@@ -11672,7 +11593,7 @@ def render_admin_workspace_v3() -> None:
             st.markdown(f'<div style="text-align:center"><img src="{logo_uri}" alt="DilSe" style="width:165px;margin:.6rem auto 1rem"></div>', unsafe_allow_html=True)
             with st.form("admin_login_v3"):
                 key = st.text_input("Admin API key", type="password")
-                submitted = st.form_submit_button("Open administrator workspace", type="primary", use_container_width=True)
+                submitted = st.form_submit_button("Open administrator workspace", type="primary", width="stretch")
             st.caption("This route is separate from user accounts. Access attempts are checked by the API.")
         if submitted:
             if remember_admin_browser_login(key):

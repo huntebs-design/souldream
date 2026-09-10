@@ -370,6 +370,24 @@ def fake_request(method: str, url: str, **_: object) -> StubResponse:
 
 
 class DilSeStreamlitTests(unittest.TestCase):
+    def test_public_terms_page_preserves_existing_sections(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        with patch("requests.request", side_effect=fake_request):
+            app = AppTest.from_file(str(app_path), default_timeout=10)
+            app.query_params["page"] = "terms"
+            app.run()
+
+            markdown = "\n".join(str(item.value) for item in app.markdown)
+            self.assertNotIn("Draft for private MVP testing", markdown)
+            self.assertIn("What you are agreeing to", markdown)
+            self.assertNotIn("administrator", markdown.lower())
+            self.assertIn("Required account processing", markdown)
+            self.assertEqual(
+                app_path.read_text(encoding="utf-8").count("Required account processing"),
+                1,
+            )
+
+
     def test_admin_incoming_message_does_not_unmount_recording_draft(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text()
         function = next(
@@ -422,22 +440,6 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertTrue(any(item.label == "Sign in" for item in app.button))
         self.assertTrue(any(item.label == "Create account" for item in app.button))
 
-    def test_public_terms_page_preserves_existing_sections(self) -> None:
-        app_path = Path(__file__).resolve().parents[1] / "app.py"
-        with patch("requests.request", side_effect=fake_request):
-            app = AppTest.from_file(str(app_path), default_timeout=10)
-            app.query_params["page"] = "terms"
-            app.run()
-
-            markdown = "\n".join(str(item.value) for item in app.markdown)
-            self.assertNotIn("Draft for private MVP testing", markdown)
-            self.assertIn("What you are agreeing to", markdown)
-            self.assertNotIn("administrator", markdown.lower())
-            self.assertIn("Required account processing", markdown)
-            self.assertEqual(
-                app_path.read_text(encoding="utf-8").count("Required account processing"),
-                1,
-            )
 
     def test_signup_keeps_processing_disclosure_on_terms_page_only(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -821,6 +823,23 @@ class DilSeStreamlitTests(unittest.TestCase):
         self.assertIn('[data-testid="stChatMessageAvatarCustom"]', source)
         self.assertIn("flex-direction: row-reverse", source)
 
+    def test_conversation_memory_review_is_not_shown(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("Review what DilSe remembers", source)
+        self.assertNotIn('st.container(key="user_memory_review")', source)
+        self.assertNotIn(
+            'f"/sessions/{st.session_state.session_id}/state"',
+            source,
+        )
+        self.assertNotIn("Turn this conversation into something useful", source)
+        self.assertNotIn("Create a message I can send", source)
+        self.assertNotIn("Give me 3 ways to say it", source)
+        self.assertNotIn("Give me one next step", source)
+        self.assertNotIn("Do you feel more ready for the real conversation?", source)
+        self.assertNotIn("render_v2_conversation_outcomes", source)
+        self.assertNotIn("v2_readiness_saved", source)
 
     def test_mobile_chat_prioritizes_messages_voice_and_composer(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -832,12 +851,12 @@ class DilSeStreamlitTests(unittest.TestCase):
             source,
         )
         self.assertIn("settings = current_conversation_settings(catalog, experience_v2)", source)
-        self.assertIn("Response options", source)
+        self.assertNotIn("Response options", source)
         self.assertNotIn("Reply tools", source)
         self.assertNotIn("render_response_options_panel", source)
-        self.assertIn("refine_shorter", source)
-        self.assertIn("refine_direct", source)
-        self.assertIn("refine_voice", source)
+        self.assertNotIn("refine_shorter", source)
+        self.assertNotIn("refine_direct", source)
+        self.assertNotIn("refine_voice", source)
         self.assertNotIn("user_response_options", source)
         self.assertNotIn("if checkpoint and not mobile_browser:", source)
         self.assertIn(".st-key-user_voice_note_composer", source)
@@ -863,6 +882,7 @@ class DilSeStreamlitTests(unittest.TestCase):
             'if st.session_state.get("scroll_chat_composer"):',
             source,
         )
+        self.assertIn('"New",\n                on_click=reset_local_conversation', source)
 
     def test_user_and_admin_chats_follow_new_messages(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
@@ -1327,21 +1347,18 @@ class DilSeStreamlitTests(unittest.TestCase):
 
     def test_account_offers_private_android_phone_alerts_outside_chat(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"
-        component_path = app_path.parent / "components" / "phone_alerts" / "index.html"
-        worker_path = app_path.parent / "components" / "phone_alerts" / "push-sw.js"
+        worker_path = app_path.parent / "public" / "dilse-push-sw.js"
         source = app_path.read_text(encoding="utf-8")
-        component_source = component_path.read_text(encoding="utf-8")
         worker_source = worker_path.read_text(encoding="utf-8")
 
         self.assertIn("def render_phone_alert_settings()", source)
-        self.assertIn('"/account/push/subscriptions"', source)
-        self.assertIn('"/account/push/unsubscribe"', source)
-        self.assertIn(
-            'sw_url="/component/app.dilse_phone_alerts/push-sw.js"', source
-        )
-        self.assertIn("Notification.requestPermission()", component_source)
-        self.assertIn("pushManager.subscribe", component_source)
-        self.assertIn("No message text is shown", component_source)
+        self.assertNotIn("phone_alerts_component(", source)
+        self.assertNotIn('"dilse_phone_alerts"', source)
+        self.assertIn('`/api/account/push/${{path}}`', source)
+        self.assertIn('"/site/dilse-push-sw.js"', source)
+        self.assertIn("Notification.requestPermission()", source)
+        self.assertIn("pushManager.subscribe", source)
+        self.assertIn("No message text is shown", source)
         self.assertIn('self.addEventListener("push"', worker_source)
         self.assertIn('client.visibilityState === "visible"', worker_source)
         self.assertIn("A DilSe response is waiting for you.", worker_source)
@@ -1446,7 +1463,29 @@ class DilSeStreamlitTests(unittest.TestCase):
             self.assertTrue(app.session_state["conversation_mode_confirmed"])
             self.assertEqual(app.session_state["conversation_mode"], "The Partner")
             self.assertTrue(any(item.key == "v2_persona_husband" for item in app.button))
+            self.assertTrue(any(item.key == "v2_persona_crush" for item in app.button))
+            self.assertTrue(any(item.key == "v2_persona_fantasy_partner" for item in app.button))
 
+            app.button(key="v2_persona_crush").click().run()
+
+            self.assertEqual(len(app.chat_input), 1)
+            self.assertIn("Add optional details", app.chat_input[0].placeholder)
+            markdown = "\n".join(str(item.value) for item in app.markdown)
+            self.assertIn("built-in personality is ready", markdown)
+
+            opening = "Your name is Ayaan and you are shy but funny. I need to tell you something."
+            app.chat_input[0].set_value(opening).run()
+
+            self.assertEqual(app.session_state["character_description"], opening)
+            self.assertEqual(app.session_state["messages"][0]["content"], opening)
+
+    def test_ai_replies_are_not_held_back_by_an_artificial_display_delay(self) -> None:
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        source = app_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("DILSE_AI_REPLY_MIN_DELAY_SECONDS", source)
+        self.assertNotIn("time.sleep(remaining_delay)", source)
+        self.assertIn("USER_TRANSCRIPT_PAGE_SIZE = 30", source)
 
     def test_login_persistence_and_three_panel_shell_are_present(self) -> None:
         app_path = Path(__file__).resolve().parents[1] / "app.py"

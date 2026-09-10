@@ -21,6 +21,7 @@
     "sitemap": "a6a06fb54140b8507c9810cf63e9902aa9fc06a799e616f117f89cd646f4bdaa"
   },
   "app.py": {
-    "render_terms": "16269af78e7fd9492b20e7feea3e485a319f927294082a8e3fcd2f1a0a1ef698"
+    "render_terms": "16269af78e7fd9492b20e7feea3e485a319f927294082a8e3fcd2f1a0a1ef698",
+    "render_terms_update": "3db145d5918af1fe90d01fa3b6941ebf90b1556db5ccc0c7bdb70aef938bee32"
   }
 }

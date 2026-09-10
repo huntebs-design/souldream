@@ -68,6 +68,33 @@ def wav_recording_with_quiet_pause(frame_rate: int = 8_000) -> bytes:
 
 
 class DilSeApiTests(unittest.TestCase):
+    def test_waitlist_cannot_be_bypassed_by_omitting_time_preference(self) -> None:
+        self.client.put("/admin/access-settings", headers=self.admin_headers,
+                        json={"require_approval_for_new_accounts": True})
+        response = self.client.post("/auth/register", json={
+            "email": "no-slot@example.com", "password": "long-test-password",
+            "display_name": "No slot", "language": "English", "country": "Pakistan",
+            "terms_accepted": True,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["user"]["access_status"], "pending")
+        self.assertEqual(response.json()["user"]["preferred_time_slot"], "flexible")
+        headers = {"X-User-Token": response.json()["token"]}
+        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200)
+        for path in ("/catalog", "/sessions", "/sessions/unread"):
+            self.assertEqual(self.client.get(path, headers=headers).status_code, 403)
+        # Enabling approval leaves existing active accounts active.
+        self.assertEqual(self.client.get("/auth/me", headers=self.user_headers).json()["access_status"], "active")
+        user_id = response.json()["user"]["id"]
+        with patch("main.send_account_activation_email", side_effect=RuntimeError("mail unavailable")):
+            activated = self.client.post(f"/admin/users/{user_id}/approve", headers=self.admin_headers,
+                                         json={"default_response_mode": "ai"})
+        self.assertEqual(activated.status_code, 200)
+        self.assertFalse(activated.json()["email_sent"])
+        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["access_status"], "active")
+        self.assertEqual(self.client.get("/catalog", headers=headers).status_code, 200)
+
+
     def test_expired_user_token_cannot_read_sessions(self) -> None:
         with main.get_connection() as connection:
             connection.execute("UPDATE auth_sessions SET expires_at = '2000-01-01T00:00:00+00:00'")
@@ -83,6 +110,10 @@ class DilSeApiTests(unittest.TestCase):
         self.assertEqual(self.client.post("/auth/login", json={"email": "tester@example.com", "password": "long-test-password"}).status_code, 401)
         self.assertEqual(self.client.post("/auth/browser-session/restore", headers={"X-Browser-Session": browser_id}).status_code, 401)
 
+    def test_image_signature_alone_does_not_make_a_valid_attachment(self) -> None:
+        with self.assertRaises(main.HTTPException) as error:
+            main.decode_admin_image(base64.b64encode(b"\x89PNG\r\n\x1a\ninvalid").decode(), "image/png")
+        self.assertEqual(error.exception.status_code, 422)
 
     def test_truncated_generated_audio_is_rejected_before_preview(self) -> None:
         with self.assertRaises(main.HTTPException) as error:
@@ -128,6 +159,11 @@ class DilSeApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temporary_directory.cleanup()
 
+    def test_api_schema_and_documentation_are_not_public(self) -> None:
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 404, response.text)
 
     def test_sensitive_routes_keep_an_authentication_dependency(self) -> None:
         from fastapi.routing import APIRoute
@@ -166,9 +202,54 @@ class DilSeApiTests(unittest.TestCase):
                         route.path,
                     )
 
+    def test_api_adds_security_headers_and_rejects_oversized_bodies(self) -> None:
+        response = self.client.get("/health")
+        self.assertEqual(response.json(), {"status": "ok"})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
 
+        response = self.client.post(
+            "/auth/login",
+            content=b"",
+            headers={"Content-Length": str(main.MAX_API_REQUEST_BYTES + 1)},
+        )
+        self.assertEqual(response.status_code, 413, response.text)
 
+    def test_repeated_failed_logins_are_rate_limited(self) -> None:
+        for _ in range(12):
+            response = self.client.post(
+                "/auth/login",
+                json={"email": "tester@example.com", "password": "wrong-password"},
+            )
+            self.assertEqual(response.status_code, 401, response.text)
+        blocked = self.client.post(
+            "/auth/login",
+            json={"email": "tester@example.com", "password": "wrong-password"},
+        )
+        self.assertEqual(blocked.status_code, 429, blocked.text)
+        self.assertIn("retry-after", blocked.headers)
 
+    def test_auth_password_inputs_are_bounded_before_hashing(self) -> None:
+        response = self.client.post(
+            "/auth/login",
+            json={"email": "tester@example.com", "password": "x" * 201},
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+
+    def test_user_chat_response_hides_internal_model_and_token_metadata(self) -> None:
+        response = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "public_response_metadata_123",
+                "message": "I want to talk.",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("model", response.json())
+        self.assertNotIn("prompt_tokens", response.json())
+        self.assertNotIn("completion_tokens", response.json())
 
     def test_conversation_id_cannot_be_claimed_by_another_user(self) -> None:
         with main.get_connection() as connection:
@@ -864,13 +945,15 @@ class DilSeApiTests(unittest.TestCase):
         self.assertEqual(invalid_country.status_code, 422)
         catalog = self.client.get("/catalog", headers=self.user_headers)
         self.assertEqual(catalog.status_code, 200)
-        self.assertEqual(len(catalog.json()["personas"]), 7)
+        self.assertEqual(len(catalog.json()["personas"]), 9)
         self.assertEqual(len(catalog.json()["scenarios"]), 9)
         self.assertEqual(len(catalog.json()["exercises"]), 9)
         self.assertEqual(len(catalog.json()["cards"]), 11)
 
         self.assertTrue(any(item["slug"] == "money_and_career" for item in catalog.json()["scenarios"]))
         self.assertTrue(any(item["slug"] == "trust_request" for item in catalog.json()["exercises"]))
+        self.assertTrue(any(item["slug"] == "crush" for item in catalog.json()["personas"]))
+        self.assertTrue(any(item["slug"] == "fantasy_partner" for item in catalog.json()["personas"]))
         privacy = self.client.put(
             "/account/privacy",
             headers=self.user_headers,
@@ -1029,32 +1112,6 @@ class DilSeApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(immediate.json()["user"]["access_status"], "active")
-
-    def test_waitlist_cannot_be_bypassed_by_omitting_time_preference(self) -> None:
-        self.client.put("/admin/access-settings", headers=self.admin_headers,
-                        json={"require_approval_for_new_accounts": True})
-        response = self.client.post("/auth/register", json={
-            "email": "no-slot@example.com", "password": "long-test-password",
-            "display_name": "No slot", "language": "English", "country": "Pakistan",
-            "terms_accepted": True,
-        })
-        self.assertEqual(response.status_code, 201, response.text)
-        self.assertEqual(response.json()["user"]["access_status"], "pending")
-        self.assertEqual(response.json()["user"]["preferred_time_slot"], "flexible")
-        headers = {"X-User-Token": response.json()["token"]}
-        self.assertEqual(self.client.get("/auth/me", headers=headers).status_code, 200)
-        for path in ("/catalog", "/sessions", "/sessions/unread"):
-            self.assertEqual(self.client.get(path, headers=headers).status_code, 403)
-        # Enabling approval leaves existing active accounts active.
-        self.assertEqual(self.client.get("/auth/me", headers=self.user_headers).json()["access_status"], "active")
-        user_id = response.json()["user"]["id"]
-        with patch("main.send_account_activation_email", side_effect=RuntimeError("mail unavailable")):
-            activated = self.client.post(f"/admin/users/{user_id}/approve", headers=self.admin_headers,
-                                         json={"default_response_mode": "ai"})
-        self.assertEqual(activated.status_code, 200)
-        self.assertFalse(activated.json()["email_sent"])
-        self.assertEqual(self.client.get("/auth/me", headers=headers).json()["access_status"], "active")
-        self.assertEqual(self.client.get("/catalog", headers=headers).status_code, 200)
 
     def test_account_activation_email_contains_no_conversation_content(self) -> None:
         with patch.dict(
@@ -1731,7 +1788,7 @@ class DilSeApiTests(unittest.TestCase):
                 "user_id": account["id"],
                 "mode": "partner",
                 "opening_message": partner_opening,
-                "persona": "husband",
+                "persona": "crush",
                 "scenario": "practice_opening_up",
                 "roleplay_intensity": "romantic",
                 "roleplay_difficulty": "supportive",
@@ -1740,7 +1797,7 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(partner.status_code, 201, partner.text)
         self.assertEqual(partner.json()["mode"], "partner")
-        self.assertEqual(partner.json()["persona"], "husband")
+        self.assertEqual(partner.json()["persona"], "crush")
 
         sessions = self.client.get("/sessions", headers=self.user_headers)
         self.assertEqual(sessions.status_code, 200, sessions.text)
@@ -1751,7 +1808,7 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(partner_session["first_user_message"], partner_opening)
         self.assertEqual(partner_session["mode"], "partner")
-        self.assertEqual(partner_session["character"], "husband")
+        self.assertEqual(partner_session["character"], "crush")
         self.assertEqual(partner_session["roleplay_intensity"], "romantic")
         self.assertEqual(partner_session["roleplay_difficulty"], "supportive")
         self.assertEqual(
@@ -1782,7 +1839,7 @@ class DilSeApiTests(unittest.TestCase):
                 "session_id": partner.json()["session_id"],
                 "message": "I was thinking about you too.",
                 "mode": "partner",
-                "persona": "husband",
+                "persona": "crush",
                 "scenario": "practice_opening_up",
                 "roleplay_intensity": "romantic",
                 "roleplay_difficulty": "supportive",
@@ -1912,7 +1969,7 @@ class DilSeApiTests(unittest.TestCase):
                 "user_id": account["id"],
                 "mode": "partner",
                 "opening_message": "I was hoping you would message.",
-                "persona": "husband",
+                "persona": "crush",
                 "scenario": "practice_opening_up",
                 "roleplay_intensity": "romantic",
             },
@@ -1988,7 +2045,7 @@ class DilSeApiTests(unittest.TestCase):
                 "user_id": account["id"],
                 "mode": "partner",
                 "opening_message": "Tell me what is on your mind.",
-                "persona": "husband",
+                "persona": "crush",
                 "scenario": "practice_opening_up",
                 "roleplay_intensity": "romantic",
             },
@@ -2089,7 +2146,7 @@ class DilSeApiTests(unittest.TestCase):
                 "user_id": account["id"],
                 "mode": "partner",
                 "opening_message": "I am here.",
-                "persona": "husband",
+                "persona": "crush",
                 "scenario": "practice_opening_up",
                 "roleplay_intensity": "romantic",
             },
@@ -2503,7 +2560,10 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(takeover.status_code, 200, takeover.text)
 
-        image_bytes = b"\x89PNG\r\n\x1a\n" + b"dilse-test-image"
+        from PIL import Image
+        image_buffer = BytesIO()
+        Image.new("RGB", (2, 2), "white").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
         sent = self.client.post(
             f"/admin/sessions/{session_id}/messages",
             headers=self.admin_headers,
@@ -2734,7 +2794,155 @@ class DilSeApiTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404, missing.text)
 
+    def test_telegram_relay_uploads_user_voice_note_to_conversation_topic(self) -> None:
+        session_id = "telegram_voice_note_session_123"
+        audio_bytes = wav_recording(seconds=2.4)
+        telegram_calls: list[tuple[str, dict[str, object]]] = []
+        upload_calls: list[dict[str, object]] = []
+        next_message_id = 1300
 
+        def fake_telegram_api(
+            method: str,
+            payload: dict[str, object] | None = None,
+            request_timeout: int = 30,
+        ) -> object:
+            del request_timeout
+            nonlocal next_message_id
+            data = payload or {}
+            telegram_calls.append((method, data))
+            if method == "createForumTopic":
+                return {"message_thread_id": 778, "name": data["name"]}
+            if method == "sendMessage":
+                next_message_id += 1
+                return {"message_id": next_message_id}
+            return True
+
+        def fake_telegram_upload(
+            method: str,
+            payload: dict[str, object],
+            *,
+            file_field: str,
+            filename: str,
+            content: bytes,
+            mime_type: str,
+            request_timeout: int = 60,
+        ) -> object:
+            upload_calls.append(
+                {
+                    "method": method,
+                    "payload": payload,
+                    "file_field": file_field,
+                    "filename": filename,
+                    "content": content,
+                    "mime_type": mime_type,
+                    "request_timeout": request_timeout,
+                }
+            )
+            return {"message_id": 1399}
+
+        telegram_environment = {
+            "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+            "TELEGRAM_ADMIN_USER_IDS": "42",
+            "TELEGRAM_ADMIN_CHAT_ID": "-100123456",
+        }
+        with patch.dict(os.environ, telegram_environment, clear=False), patch.object(
+            main, "telegram_api", side_effect=fake_telegram_api
+        ), patch.object(
+            main, "telegram_api_upload", side_effect=fake_telegram_upload
+        ):
+            sent = self.client.post(
+                f"/sessions/{session_id}/voice-notes",
+                headers=self.user_headers,
+                json={
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "audio_mime_type": "audio/wav",
+                    "audio_filename": "telegram-private-note.wav",
+                    "upload_id": "telegram_voice_note_upload_12345",
+                    "mode": "listener",
+                },
+            )
+            self.assertEqual(sent.status_code, 201, sent.text)
+            self.assertEqual(main.process_telegram_outbox(), 1)
+
+        self.assertEqual(len(upload_calls), 1)
+        upload = upload_calls[0]
+        self.assertEqual(upload["method"], "sendDocument")
+        self.assertEqual(upload["file_field"], "document")
+        self.assertEqual(upload["filename"], "telegram-private-note.wav")
+        self.assertEqual(upload["mime_type"], "audio/wav")
+        self.assertEqual(upload["content"], audio_bytes)
+        self.assertEqual(upload["payload"]["message_thread_id"], 778)
+        self.assertIn("User voice note", str(upload["payload"]["caption"]))
+        self.assertIn("0:02", str(upload["payload"]["caption"]))
+        relayed_text = "\n".join(
+            str(payload.get("text") or "")
+            for method, payload in telegram_calls
+            if method == "sendMessage"
+        )
+        self.assertNotIn("<b>User</b>\nVoice note", relayed_text)
+        with main.get_connection() as connection:
+            link = connection.execute(
+                """SELECT dilse_message_id FROM telegram_message_links
+                   WHERE telegram_message_id = 1399"""
+            ).fetchone()
+        self.assertIsNotNone(link)
+        self.assertEqual(link["dilse_message_id"], sent.json()["user_message_id"])
+
+    def test_telegram_voice_note_relay_falls_back_to_dashboard_notice(self) -> None:
+        session_id = "telegram_voice_fallback_session_123"
+        audio_bytes = wav_recording(seconds=1)
+        sent_text: list[str] = []
+
+        def fake_telegram_api(
+            method: str,
+            payload: dict[str, object] | None = None,
+            request_timeout: int = 30,
+        ) -> object:
+            del request_timeout
+            data = payload or {}
+            if method == "createForumTopic":
+                return {"message_thread_id": 779, "name": data["name"]}
+            if method == "sendMessage":
+                sent_text.append(str(data.get("text") or ""))
+                return {"message_id": 1400 + len(sent_text)}
+            return True
+
+        telegram_environment = {
+            "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+            "TELEGRAM_ADMIN_USER_IDS": "42",
+            "TELEGRAM_ADMIN_CHAT_ID": "-100123456",
+        }
+        with patch.dict(os.environ, telegram_environment, clear=False), patch.object(
+            main, "telegram_api", side_effect=fake_telegram_api
+        ), patch.object(
+            main,
+            "telegram_api_upload",
+            side_effect=RuntimeError("Telegram sendDocument failed: rejected"),
+        ):
+            sent = self.client.post(
+                f"/sessions/{session_id}/voice-notes",
+                headers=self.user_headers,
+                json={
+                    "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+                    "audio_mime_type": "audio/wav",
+                    "audio_filename": "fallback-note.wav",
+                    "upload_id": "telegram_voice_fallback_upload_12345",
+                    "mode": "listener",
+                },
+            )
+            self.assertEqual(sent.status_code, 201, sent.text)
+            self.assertEqual(main.process_telegram_outbox(), 1)
+
+        self.assertTrue(
+            any("administrator dashboard" in message for message in sent_text)
+        )
+        with main.get_connection() as connection:
+            outbox = connection.execute(
+                "SELECT status, attempts FROM telegram_outbox WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        self.assertEqual(outbox["status"], "sent")
+        self.assertEqual(outbox["attempts"], 1)
 
     def test_live_admin_handoff_supports_partner_mode(self) -> None:
         privacy = self.client.put(
@@ -3421,6 +3629,62 @@ class DilSeApiTests(unittest.TestCase):
         ]
         self.assertEqual(len(deletion_rows), 2)
 
+    def test_predefined_partner_characters_use_and_remember_opening_details(self) -> None:
+        opening = (
+            "Your name is Ayaan, you are shy in person, and you use dry humour. "
+            "I have wanted to tell you something."
+        )
+        crush = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "crush_character_123",
+                "message": opening,
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "crush",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(crush.status_code, 200, crush.text)
+        crush_prompt = FakeCompletions.calls[-1]["messages"][1]["content"]
+        self.assertIn("warm, curious, lightly flirtatious", crush_prompt)
+        self.assertIn("Supplemental character context", crush_prompt)
+        self.assertIn("additions to the built-in character profile", crush_prompt)
+        self.assertIn(opening, crush_prompt)
+
+        follow_up = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "crush_character_123",
+                "message": "What did you think I was going to say?",
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "crush",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(follow_up.status_code, 200, follow_up.text)
+        self.assertIn(opening, FakeCompletions.calls[-1]["messages"][1]["content"])
+
+        fantasy = self.client.post(
+            "/chat",
+            headers=self.user_headers,
+            json={
+                "session_id": "fantasy_character_123",
+                "message": "Your name is Zain and this scene takes place in a rooftop garden.",
+                "mode": "partner",
+                "scenario": "practice_opening_up",
+                "persona": "fantasy_partner",
+                "roleplay_intensity": "romantic",
+            },
+        )
+        self.assertEqual(fantasy.status_code, 200, fantasy.text)
+        fantasy_prompt = FakeCompletions.calls[-1]["messages"][1]["content"]
+        self.assertIn("confident, attentive, affectionate", fantasy_prompt)
+        self.assertIn("fictional adult romantic partner", fantasy_prompt)
+        self.assertIn("rooftop garden", fantasy_prompt)
 
     def test_partner_character_profile_is_prompted_stored_and_reused(self) -> None:
         privacy = self.client.put(

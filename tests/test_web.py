@@ -13,6 +13,109 @@ import web
 
 
 class PublicSiteTests(unittest.TestCase):
+
+
+
+
+
+
+    def test_web_health_and_websocket_cleanup_cover_streamlit_failure(self):
+        source = (Path(web.ROOT) / "web.py").read_text(encoding="utf-8")
+
+        self.assertIn('@app.get("/health")', source)
+        self.assertIn('/app/_stcore/health', source)
+        self.assertIn('"streamlit":false', source.lower())
+        self.assertIn("return_when=asyncio.FIRST_COMPLETED", source)
+        self.assertIn("task.cancel()", source)
+
+
+    def test_streamlit_supervisor_restarts_an_exited_child(self):
+        class FakeProcess:
+            def __init__(self):
+                self.exit_code = None
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return self.exit_code
+
+            def terminate(self):
+                self.terminated = True
+                self.exit_code = -15
+
+            def wait(self, timeout=None):
+                del timeout
+                return self.exit_code
+
+            def kill(self):
+                self.killed = True
+                self.exit_code = -9
+
+        first = FakeProcess()
+        second = FakeProcess()
+        supervisor = web.StreamlitProcessSupervisor(
+            restart_delay_seconds=1,
+            max_restart_delay_seconds=4,
+        )
+
+        with patch("web.subprocess.Popen", side_effect=[first, second]) as popen:
+            self.assertTrue(supervisor.ensure_running(now=0))
+            first.exit_code = 137
+            self.assertFalse(supervisor.ensure_running(now=10))
+            self.assertFalse(supervisor.ensure_running(now=10.9))
+            self.assertTrue(supervisor.ensure_running(now=11))
+            self.assertEqual(popen.call_count, 2)
+            self.assertEqual(popen.call_args.args[0], web.streamlit_command())
+
+        supervisor.stop()
+        self.assertTrue(second.terminated)
+
+
+    def test_streamlit_security_limits_are_explicit(self):
+        config = (Path(web.ROOT) / ".streamlit" / "config.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("enableCORS = true", config)
+        self.assertIn("enableXsrfProtection = true", config)
+        self.assertIn("maxUploadSize = 24", config)
+        source = (Path(web.ROOT) / "web.py").read_text(encoding="utf-8")
+        self.assertNotIn("max_size=None", source)
+
+
+    def test_gateway_sets_security_headers_and_caps_request_bodies(self):
+        response = web.add_security_headers(web.PlainTextResponse("ok"))
+        self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
+
+        request = web.Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/api/chat",
+                "raw_path": b"/api/chat",
+                "query_string": b"",
+                "headers": [
+                    (
+                        b"content-length",
+                        str(web.MAX_PROXY_BODY_BYTES + 1).encode("ascii"),
+                    )
+                ],
+                "client": ("198.51.100.42", 41234),
+                "server": ("testserver", 443),
+            }
+        )
+        with self.assertRaises(ValueError):
+            asyncio.run(web.limited_request_body(request))
+
+
+    def test_public_site_schema_is_disabled(self):
+        self.assertIsNone(web.app.openapi_url)
+        self.assertIsNone(web.app.docs_url)
+        self.assertIsNone(web.app.redoc_url)
+
+
     def test_complete_bilingual_topic_library(self):
         self.assertEqual(len(web.TOPICS), 22)
         self.assertEqual(len(web.URDU_TOPICS), 22)
