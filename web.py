@@ -334,37 +334,15 @@ def page_shell(
       <a href="/how-it-works/">How it works</a>
       <a href="/conversation-topics/">Conversation topics</a>
       <a href="/ur/" lang="ur">اردو</a>
-      <a class="nav-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Android app</a>
       <a class="nav-cta" href="/app/?auth=signin">Sign in</a>
     </nav>
   </header>
   <main id="main">{body}</main>
-  <aside class="android-install-prompt" id="android-install-prompt" aria-label="Download DilSe for Android" hidden>
-    <div class="install-prompt-brand">
-      <img src="/assets/dilse-mark.svg" alt="">
-      <div><strong>Take DilSe with you</strong><span>Android 8+ · 58 MB</span></div>
-    </div>
-    <a class="install-prompt-download" href="/downloads/DilSe-latest.apk" download>Download app</a>
-    <button class="install-prompt-dismiss" type="button" aria-label="Dismiss Android app download">Not now</button>
-  </aside>
   <footer>
     <img src="/assets/dilse-logo.svg" alt="DilSe">
     <p>Relationship guidance and conversation practice for adults 18+ in Pakistan.</p>
     <div><a href="/about/">About</a><a href="/editorial-policy/">Editorial policy</a><a href="/contact/">Contact</a><a href="/privacy/">Privacy</a><a href="/safety/">Safety</a><a href="/app/?page=terms">Terms</a></div>
   </footer>
-  <script>
-    (() => {{
-      const prompt = document.getElementById('android-install-prompt');
-      const isAndroid = /Android/i.test(navigator.userAgent);
-      const dismissed = sessionStorage.getItem('dilse-android-install-dismissed') === '1';
-      if (!prompt || !isAndroid || dismissed) return;
-      prompt.hidden = false;
-      prompt.querySelector('.install-prompt-dismiss')?.addEventListener('click', () => {{
-        prompt.hidden = true;
-        sessionStorage.setItem('dilse-android-install-dismissed', '1');
-      }});
-    }})();
-  </script>
 </body>
 </html>"""
 
@@ -381,7 +359,7 @@ def home_page() -> str:
     <h1>Relationship conversation practice for Pakistani women</h1>
     <p class="lede">Talk through a relationship concern, find the words you want to use, and practise the conversation before having it at home.</p>
     <p class="roman-urdu" lang="ur-Latn">Jo baat kehna mushkil ho, pehle yahan keh lijiye.</p>
-    <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="button button-app" href="/downloads/DilSe-latest.apk" download><img src="/assets/dilse-mark.svg" alt="">Download Android app</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
+    <div class="actions hero-actions"><a class="button" href="/app/?auth=create">Start a conversation</a><a class="how-link" href="/how-it-works/">See how DilSe works</a></div>
     <ul class="facts"><li>500,000+ women supported</li><li>Psychologist-trained AI</li><li>100% On-device privacy</li></ul>
   </div>
   <div class="hero-art"><img src="/assets/dilse-woman-letter.webp" width="768" height="1024" alt="Illustration of a Pakistani woman holding a letter beside a window"><p>A place to prepare the words you have been holding back.</p></div>
@@ -463,7 +441,6 @@ def android_page() -> str:
     <p class="eyebrow">DilSe for Android</p>
     <h1>Your conversations, ready when you are</h1>
     <p class="lede">Continue Listener and Partner conversations, record voice notes and receive a private alert when a DilSe response is waiting.</p>
-    <a class="button android-download" href="/downloads/DilSe-latest.apk" download>Download DilSe for Android</a>
     <p class="download-note">Android 8 or newer · Adults 18+ · Version 1.0.0</p>
   </div>
   <div class="android-device" aria-label="Preview of the DilSe Android conversation screen">

@@ -99,10 +99,10 @@ class PublicSiteTests(unittest.TestCase):
         self.assertIn(".breadcrumbs .breadcrumb-current", css)
         self.assertIn("@media (max-width: 380px)", css)
 
-    def test_android_page_uses_the_signed_first_party_download(self):
+    def test_android_page_has_no_download_link(self):
         html = web.android_page()
-        self.assertIn("Download DilSe for Android", html)
-        self.assertIn('/downloads/DilSe-latest.apk', html)
+        self.assertNotIn('class="button android-download"', html)
+        self.assertNotIn('/downloads/DilSe-latest.apk', html)
         self.assertIn("Listener and Partner", html)
         self.assertNotIn("Google Play", html)
 
@@ -112,20 +112,20 @@ class PublicSiteTests(unittest.TestCase):
             "application/vnd.android.package-archive",
         )
 
-    def test_home_offers_the_android_app_above_the_fold(self):
+    def test_home_has_no_mobile_download_links(self):
         html = web.home_page()
         hero = html.split('</section>', 1)[0]
-        self.assertIn("Download Android app", hero)
-        self.assertIn('/downloads/DilSe-latest.apk', hero)
-        self.assertIn('class="button button-app"', hero)
-        self.assertIn('class="nav-app"', hero)
+        self.assertNotIn("Download Android app", hero)
+        self.assertNotIn('/downloads/DilSe-latest.apk', hero)
+        self.assertNotIn('class="button button-app"', hero)
+        self.assertNotIn('class="nav-app"', hero)
 
-    def test_android_browsers_receive_a_dismissible_install_prompt(self):
+    def test_android_install_prompt_is_removed(self):
         html = web.home_page()
-        self.assertIn('id="android-install-prompt"', html)
-        self.assertIn("/Android/i.test(navigator.userAgent)", html)
-        self.assertIn("Download app", html)
-        self.assertIn("Not now", html)
+        self.assertNotIn('id="android-install-prompt"', html)
+        self.assertNotIn("/Android/i.test(navigator.userAgent)", html)
+        self.assertNotIn("Download app", html)
+        self.assertNotIn("Not now", html)
 
 
 
